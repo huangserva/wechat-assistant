@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="assets/banner.png" alt="WeChat Assistant" width="800">
-</p>
-
-<p align="center">
   <b>Hermes Skill</b> — 微信 AI 个人助手，自动从微信聊天中提取待办、日程、干货、热点、技术讨论，推送到飞书。
   <br>macOS 14/15 + 微信 4.0+ + Python 3.9/3.13 验证通过
 </p>
@@ -29,7 +25,7 @@
 ## 工作原理
 
 <p align="center">
-  <img src="assets/architecture.png" alt="architecture" width="800">
+  <img src="assets/architecture.png" alt="数据流架构图" width="800">
 </p>
 
 **两层设计**：

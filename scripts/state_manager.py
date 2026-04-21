@@ -207,6 +207,165 @@ class StateManager:
         state['preference']['run_count'] = state['preference'].get('run_count', 0) + 1
         self._write(state)
 
+    # ─── Acknowledged（已读确认）─────────────────────────────
+
+    def ack_todo(self, todo_id):
+        """标记某个 todo 为已读（acknowledged=true）"""
+        state = self._read()
+        for item in state['todos']['items']:
+            if item.get('id') == todo_id and not item.get('acknowledged'):
+                item['acknowledged'] = True
+                item['ack_time'] = datetime.now(tz=_TZ8).isoformat()
+                self._write(state)
+                return True
+        return False
+
+    def ack_all_todos(self):
+        """标记所有 open todo 为已读"""
+        state = self._read()
+        count = 0
+        for item in state['todos']['items']:
+            if item.get('status') == 'open' and not item.get('acknowledged'):
+                item['acknowledged'] = True
+                item['ack_time'] = datetime.now(tz=_TZ8).isoformat()
+                count += 1
+        if count > 0:
+            self._write(state)
+        return count
+
+    def auto_ack_old_todos(self, hours=2):
+        """自动确认推送超过 N 小时仍未 resolve 的 todo 为已读"""
+        state = self._read()
+        cutoff = datetime.now(tz=_TZ8) - timedelta(hours=hours)
+        count = 0
+        for item in state['todos']['items']:
+            if item.get('status') != 'open':
+                continue
+            if item.get('acknowledged'):
+                continue
+            # 用 created 时间判断：如果创建时间距今超过 hours 小时，说明已经推送过了
+            created_str = item.get('created', '')
+            if created_str:
+                try:
+                    created = datetime.fromisoformat(created_str)
+                    if created < cutoff:
+                        item['acknowledged'] = True
+                        item['ack_time'] = datetime.now(tz=_TZ8).isoformat()
+                        count += 1
+                except (ValueError, TypeError):
+                    pass
+        if count > 0:
+            self._write(state)
+        return count
+
+    # ─── User State（用户状态感知）────────────────────────────
+
+    _USER_STATE_DEFAULT = {
+        'current': {
+            'status': 'idle',
+            'context': '',
+            'last_active': '',
+            'active_todos': 0,
+            'urgent_unresolved': 0,
+            'source': 'inferred',
+        },
+        'schedule': {
+            'working_hours': '09:00-23:00',
+            'sleep_hours': '23:00-08:00',
+            'timezone': 'Asia/Shanghai',
+        },
+        'patterns': {
+            'avg_response_time_min': 0,
+            'peak_active_hours': ['09:00-12:00', '14:00-18:00', '20:00-23:00'],
+            'ignore_rate_last_7d': 0.0,
+            'last_updated': '',
+        },
+        'feedback_stats': {
+            'total_pushed': 0,
+            'total_acted': 0,
+            'total_ignored': 0,
+            'total_snoozed': 0,
+            'by_type': {},
+        },
+    }
+
+    def _user_state_path(self):
+        """user_state.json 和 scan_state.json 同目录"""
+        return os.path.join(os.path.dirname(self.state_path), 'user_state.json')
+
+    def get_user_state(self):
+        """读取用户状态，不存在则返回默认"""
+        path = self._user_state_path()
+        if not os.path.exists(path):
+            return json.loads(json.dumps(self._USER_STATE_DEFAULT))
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return json.loads(json.dumps(self._USER_STATE_DEFAULT))
+
+    def update_user_state(self, updates):
+        """局部更新 user_state（合并到现有 state）"""
+        path = self._user_state_path()
+        state = self.get_user_state()
+        # 深度合并
+        def _deep_merge(base, override):
+            for k, v in override.items():
+                if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+                    _deep_merge(base[k], v)
+                else:
+                    base[k] = v
+        _deep_merge(state, updates)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        os.replace(tmp, path)
+        return state
+
+    def infer_user_status(self):
+        """推断用户当前状态，返回 (status, context)"""
+        state = self._read()
+        now = datetime.now(tz=_TZ8)
+        now_time = now.strftime('%H:%M')
+
+        # 读 user_state 的 schedule
+        user_state = self.get_user_state()
+        sleep_hours = user_state.get('schedule', {}).get('sleep_hours', '23:00-08:00')
+        sleep_start, sleep_end = sleep_hours.split('-')
+
+        # 1. 睡眠时间
+        if sleep_start <= now_time or now_time < sleep_end:
+            return 'sleeping', f'睡眠时间（{sleep_hours}）'
+
+        # 2. 有 urgent 未解决
+        todos = state.get('todos', {}).get('items', [])
+        urgent_open = [t for t in todos if t.get('status') == 'open' and t.get('urgent')]
+        if urgent_open:
+            return 'busy', f'{len(urgent_open)}个紧急待办未处理'
+
+        # 3. 最近30分钟有消息活动（检查 collector.db）
+        try:
+            import sqlite3
+            db_dir = os.path.dirname(self.state_path)
+            collector_db = os.path.join(db_dir, 'collector.db')
+            if os.path.exists(collector_db):
+                conn = sqlite3.connect(collector_db)
+                cutoff = int(now.timestamp()) - 1800
+                row = conn.execute(
+                    'SELECT COUNT(*) FROM messages WHERE msg_time > ?', (cutoff,)
+                ).fetchone()
+                conn.close()
+                if row[0] > 20:
+                    return 'busy', f'消息活跃（最近30分钟{row[0]}条）'
+                elif row[0] > 0:
+                    return 'working', f'在线（最近30分钟{row[0]}条消息）'
+        except Exception:
+            pass
+
+        return 'idle', '无活跃活动'
+
     # ─── General ─────────────────────────────────────────────
 
     def get_full_state(self):
