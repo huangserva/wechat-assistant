@@ -3,15 +3,16 @@
 extract_preferences.py — 从 collector.db 提取用户偏好/观点消息（不调 AI）
 
 用法：
-  python3 extract_preferences.py --config config.yaml           # 今日累计
+  python3 extract_preferences.py --config config.yaml           # 增量：默认从上次扫描点继续（带少量回补）
   python3 extract_preferences.py --config config.yaml --full     # 昨天整天
   python3 extract_preferences.py --config config.yaml --days 7   # 最近 N 天
 
 输出 JSON 到 stdout：
 {
-  "mode": "today|full|days",
+  "mode": "incremental|full|days",
   "ts_start": ...,
   "ts_end": ...,
+  "scan_window": {"start_time": "2026-04-22 09:00:00", "end_time": "2026-04-22 13:00:00"},
   "preferences": [
     {"category": "tech|business|writing|decision|opinion",
      "content": "...",
@@ -33,9 +34,12 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 _TZ8 = timezone(timedelta(hours=8))
+_PREFERENCE_BOOTSTRAP_LOOKBACK_HOURS = 24
+_PREFERENCE_WINDOW_OVERLAP_SECONDS = 20 * 60
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
+from state_manager import StateManager
 
 # ═══════════════════════════════════════════════════════════
 # 偏好/观点 关键词模式
@@ -141,6 +145,7 @@ def parse_args():
     parser.add_argument('--config', required=True, help='YAML 配置文件路径')
     parser.add_argument('--full', action='store_true', help='全量模式：昨天整天')
     parser.add_argument('--days', type=int, help='最近 N 天')
+    parser.add_argument('--state', help='scan_state.json 路径（默认从 config 推导）')
     return parser.parse_args()
 
 
@@ -148,6 +153,13 @@ def load_config(config_path):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'decrypt'))
     from config import load_config as _load
     return _load(config_path)
+
+
+def get_state_path(config_path, state_arg=None):
+    if state_arg:
+        return state_arg
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    return os.path.join(config_dir, 'scan_state.json')
 
 
 def get_preference_messages(collector_db, ts_start, ts_end, self_wxid='__self__'):
@@ -332,6 +344,8 @@ def main():
 
     now = datetime.now(tz=_TZ8)
     now_ts = int(now.timestamp())
+    state_path = get_state_path(args.config, args.state)
+    sm = StateManager(state_path)
 
     if args.full:
         today_0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -344,10 +358,15 @@ def main():
         ts_end = now_ts
         mode = f'last_{args.days}_days'
     else:
-        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        ts_start = int(today_midnight.timestamp())
+        last_scan_ts = sm.get_preference_last_scan_ts()
+        if last_scan_ts > 0:
+            ts_start = max(0, last_scan_ts - _PREFERENCE_WINDOW_OVERLAP_SECONDS)
+        else:
+            ts_start = int((now - timedelta(hours=_PREFERENCE_BOOTSTRAP_LOOKBACK_HOURS)).timestamp())
         ts_end = now_ts
-        mode = 'today'
+        if ts_start >= ts_end:
+            ts_start = max(0, ts_end - _PREFERENCE_WINDOW_OVERLAP_SECONDS)
+        mode = 'incremental'
 
     # 提取偏好消息
     preferences = get_preference_messages(collector_db, ts_start, ts_end, self_wxid)
@@ -365,6 +384,12 @@ def main():
         'mode': mode,
         'ts_start': ts_start,
         'ts_end': ts_end,
+        'scan_window': {
+            'start_ts': ts_start,
+            'end_ts': ts_end,
+            'start_time': datetime.fromtimestamp(ts_start, tz=_TZ8).strftime('%Y-%m-%d %H:%M:%S'),
+            'end_time': datetime.fromtimestamp(ts_end, tz=_TZ8).strftime('%Y-%m-%d %H:%M:%S'),
+        },
         'scan_time': now.strftime('%Y-%m-%d %H:%M'),
         'stats': {
             'preference_count': len(preferences),
@@ -373,6 +398,7 @@ def main():
         },
         'preferences': preferences,
         'writing_samples': [c for c, _ in writing_samples],
+        'scan_state_path': state_path,
     }
 
     print(json.dumps(output, ensure_ascii=False, indent=2))

@@ -28,7 +28,7 @@ class StateManager:
                 'trending': {'items': [], 'last_scan_ts': 0, 'daily_done': ''},
                 'tech': {'daily_done': ''},
                 'insight': {'last_run_date': ''},
-                'preference': {'last_run_date': '', 'run_count': 0},
+                'preference': {'last_run_date': '', 'run_count': 0, 'last_scan_ts': 0, 'last_archive_ts': 0},
             }
         try:
             with open(self.state_path, 'r') as f:
@@ -41,7 +41,7 @@ class StateManager:
                 'trending': {'items': [], 'last_scan_ts': 0, 'daily_done': ''},
                 'tech': {'daily_done': ''},
                 'insight': {'last_run_date': ''},
-                'preference': {'last_run_date': '', 'run_count': 0},
+                'preference': {'last_run_date': '', 'run_count': 0, 'last_scan_ts': 0, 'last_archive_ts': 0},
             }
 
     def _write(self, state):
@@ -197,12 +197,44 @@ class StateManager:
     # ─── Preference ─────────────────────────────────────────
 
     def get_preference_state(self):
-        return self._read().get('preference', {'last_run_date': '', 'run_count': 0})
+        pref = self._read().get('preference', {})
+        return {
+            'last_run_date': pref.get('last_run_date', ''),
+            'run_count': pref.get('run_count', 0),
+            'last_scan_ts': pref.get('last_scan_ts', 0),
+            'last_archive_ts': pref.get('last_archive_ts', 0),
+        }
+
+    def get_preference_last_scan_ts(self):
+        return self.get_preference_state().get('last_scan_ts', 0)
+
+    def get_preference_last_archive_ts(self):
+        return self.get_preference_state().get('last_archive_ts', 0)
+
+    def update_preference_archive(self, last_scan_ts=None, last_archive_ts=None):
+        state = self._read()
+        if 'preference' not in state:
+            state['preference'] = {
+                'last_run_date': '',
+                'run_count': 0,
+                'last_scan_ts': 0,
+                'last_archive_ts': 0,
+            }
+        if last_scan_ts is not None:
+            state['preference']['last_scan_ts'] = last_scan_ts
+        if last_archive_ts is not None:
+            state['preference']['last_archive_ts'] = last_archive_ts
+        self._write(state)
 
     def mark_preference_done(self, date_str):
         state = self._read()
         if 'preference' not in state:
-            state['preference'] = {'last_run_date': '', 'run_count': 0}
+            state['preference'] = {
+                'last_run_date': '',
+                'run_count': 0,
+                'last_scan_ts': 0,
+                'last_archive_ts': 0,
+            }
         state['preference']['last_run_date'] = date_str
         state['preference']['run_count'] = state['preference'].get('run_count', 0) + 1
         self._write(state)

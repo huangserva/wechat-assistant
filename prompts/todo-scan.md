@@ -92,40 +92,21 @@ python3 extract_todos.py --config /Users/serva/wechat-assistant/config.yaml
 > 默认是**增量窗口模式**：从上次 `todos.last_scan_ts` 往前回补约 15 分钟到当前时间；首次运行回看最近 12 小时。
 > 输出 JSON 到 stdout，包含 `conversations`、`existing_todos`（来自 `scan_state.json`）、`scan_state_path`、`scan_window`。
 
-### 4. 轻量偏好归档
+### 4. 轻量偏好归档（低频）
 
-每次扫描顺便归档今天的偏好消息（不调 AI，纯关键词匹配）：
+不要每次 todo 都重扫“今天累计偏好”。改为**最多每 4 小时**顺手做一次增量归档（不调 AI，纯关键词匹配）：
 
 ```bash
-# 提取今日偏好数据，追加到按天归档文件
-python3 extract_preferences.py --config /Users/serva/wechat-assistant/config.yaml > /tmp/pref_today.json
-python3 -c "
-import json, os, datetime
-pref_dir = '/Users/serva/wechat-assistant/preferences'
-os.makedirs(pref_dir, exist_ok=True)
-date_str = datetime.date.today().isoformat()
-path = os.path.join(pref_dir, f'{date_str}.json')
-
-# 合并：同一天的多次归档，去重
-new_data = json.load(open('/tmp/pref_today.json'))
-if os.path.exists(path):
-    existing = json.load(open(path))
-    seen = {p['msg_time'] for p in existing.get('preferences', [])}
-    for p in new_data.get('preferences', []):
-        if p['msg_time'] not in seen:
-            existing['preferences'].append(p)
-            seen.add(p['msg_time'])
-    existing['stats'] = new_data['stats']
-    existing['scan_time'] = new_data['scan_time']
-    with open(path, 'w') as f:
-        json.dump(existing, f, ensure_ascii=False, indent=2)
-else:
-    with open(path, 'w') as f:
-        json.dump(new_data, f, ensure_ascii=False, indent=2)
-"
+python3 archive_preferences.py --config /Users/serva/wechat-assistant/config.yaml --min-interval-sec 14400
 ```
 
-> 这步不需要推送，只是默默归档。`preference-scan` cron 会读这些归档文件做深度分析。
+> 默认是**低频增量归档**：
+> - 距上次归档不足 4 小时 → 直接跳过（正常）
+> - 真正执行时，只从 `preference.last_scan_ts` 往前回补约 20 分钟到当前时间
+> - 首次运行回看最近 24 小时
+> - 会按消息实际日期累计写入 `preferences/YYYY-MM-DD.json`
+>
+> 这步不需要推送，只是默默归档。`preference-scan` cron 会读这些按天累计的归档文件做深度分析。
 
 ### 5. 分析 JSON 输出
 

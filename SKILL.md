@@ -75,7 +75,8 @@ scripts/
   extract_trending.py        — 提取跨群热点（增量窗口 / 今日累计池）→ JSON
   extract_tech.py            — 提取技术讨论（含 daily_done 去重）→ JSON
   insight.py                 — 读取多天 digest JSON，输出合并数据供 LLM 分析
-  extract_preferences.py     — 提取用户偏好/观点消息（关键词模式匹配）+ 写作样本 → JSON
+  extract_preferences.py     — 提取用户偏好/观点消息（增量窗口，关键词模式匹配）+ 写作样本 → JSON
+  archive_preferences.py     — 低频增量归档偏好/写作样本到 preferences/YYYY-MM-DD.json
   requirements.txt           — Python 依赖
 prompts/
   todo-scan.md               — 待办扫描 cron prompt（决策脑 v2：Layer A 状态感知 + acknowledged + 优先级排序）
@@ -102,7 +103,7 @@ digests/          — 每日干货存档（YYYY-MM-DD.json，供 insight 分析�
 group_profiles.json — 群画像（持续更新，由 insight cron 维护）
 topic_threads.json — 话题线索（持续更新，由 insight cron 维护）
 learned_aliases.json — trending 话题学习层（LLM 自动追加的同义词映射 + __IGNORE__ 过滤）
-preferences/      — 每日偏好存档（YYYY-MM-DD.json，由 todo-scan 归档）
+preferences/      — 每日偏好存档（YYYY-MM-DD.json，由 todo-scan 低频增量归档）
 profile/
   servasyy_profile.json — 用户偏好画像（持续更新，由 preference-scan cron 维护）
 ```
@@ -132,7 +133,7 @@ profile/
   "trending": {\"items\": [], \"last_scan_ts\": 1776559295, \"daily_done\": \"2026-04-19\"},
   "tech": {\"daily_done\": \"2026-04-18\"},
   "insight": {"last_run_date": "", "last_analyzed_dates": [], "run_count": 0},
-  "preference": {"last_run_date": "", "run_count": 0}
+  "preference": {"last_run_date": "", "run_count": 0, "last_scan_ts": 0, "last_archive_ts": 0}
 }
 ```
 
@@ -143,7 +144,7 @@ profile/
 - **trending**: `last_scan_ts` 记录上次扫描时间。**增量窗口模式**：默认从上次扫描点回补约 20 分钟到当前，首次运行回看最近 6 小时。去重靠 `existing_topics`（只推新增或明显升温的话题）。同时会把新消息累计进 `trending_day_pool.sqlite3`，供 `trending-daily` 直接读取。`daily_done` 仅供 trending-daily 防重复日汇总
 - **tech**: 按 `daily_done` 日期去重，同一天的只跑一次
 - **insight**: `last_run_date` 防止同一天重复运行，`last_analyzed_dates` 记录已分析的 digest 日期，`run_count` 累计运行次数
-- **preference**: `last_run_date` 防止同一天重复运行，`run_count` 累计运行次数。画像存储在 `profile/servasyy_profile.json`
+- **preference**: `last_run_date` 防止同一天重复运行，`run_count` 累计运行次数。`last_scan_ts` / `last_archive_ts` 用于 todo-scan 低频增量归档，避免每次都重扫今天累计数据。画像存储在 `profile/servasyy_profile.json`
 
 **state_manager.py API**：
 ```python
@@ -155,8 +156,9 @@ sm.resolve_todo(id_)     # 标记 done
 sm.get_calendar()        # → list of calendar items
 sm.add_calendar_event(item_dict)
 sm.confirm_calendar_event(id_)
-sm.get_preference_state()  # → {'last_run_date': '', 'run_count': 0}
-sm.mark_preference_done()  # 更新 last_run_date 和 run_count
+sm.get_preference_state()        # → {'last_run_date': '', 'run_count': 0, 'last_scan_ts': 0, 'last_archive_ts': 0}
+sm.update_preference_archive()    # 更新 last_scan_ts / last_archive_ts
+sm.mark_preference_done()         # 更新 last_run_date 和 run_count
 sm.update(key, value)    # 通用更新
 sm.save()                # 写回文件
 ```
@@ -197,11 +199,15 @@ insight cron (每3天 20:00)
 ### 用户偏好画像数据流（Layer 4）
 
 ```
-preference-scan cron (每天 23:00)
-  → extract_preferences.py 读 collector.db 中 sender='__self__' 的消息
+todo-scan (低频触发，最多每4小时一次)
+  → archive_preferences.py 按 `preference.last_scan_ts` 做增量提取
   → 关键词分类: tech/business/decision/opinion → preferences[]
-  → 提取写作样本（均匀采样最多50条）→ writing_samples[]
-  → 输出 JSON → LLM 深度分析5个维度（技术、商业、决策、沟通、写作风格）
+  → 提取写作样本 → 累积写入 preferences/YYYY-MM-DD.json
+  → 更新 scan_state.json (preference.last_scan_ts / last_archive_ts)
+
+preference-scan cron (每天 23:00)
+  → 读取最近 7 天 preferences/*.json 增量归档
+  → LLM 深度分析5个维度（技术、商业、决策、沟通、写作风格）
   → 增量合并到 profile/servasyy_profile.json
   → 更新 scan_state.json (preference.last_run_date)
   → 推飞书偏好报告
@@ -396,6 +402,22 @@ python3 extract_calendar.py --config config.yaml --full
 ```
 
 输出包含 `existing_events` 和 `scan_window`，供 prompt 对比去重并展示扫描范围。
+
+### 提取/归档偏好数据
+
+```bash
+# 增量（默认从上次扫描点继续，带约 20 分钟回补）
+python3 extract_preferences.py --config config.yaml
+
+# 最近 N 天
+python3 extract_preferences.py --config config.yaml --days 7
+
+# 低频归档（todo-scan 顺手触发，默认至少间隔 4 小时）
+python3 archive_preferences.py --config config.yaml --min-interval-sec 14400
+```
+
+`extract_preferences.py` 输出包含 `scan_window` 和 `scan_state_path`。
+`archive_preferences.py` 会把增量结果累积写入 `preferences/YYYY-MM-DD.json`，并更新 `preference.last_scan_ts / last_archive_ts`。
 
 ### 提取群聊干货
 
