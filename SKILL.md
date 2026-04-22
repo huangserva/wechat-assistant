@@ -67,11 +67,12 @@ scripts/
   state_manager.py           — 统一状态读写模块（读写 scan_state.json）
   db_writer.py               — assistant.db 统一写入工具（9种表 + scan_log + SQL查询）
   refresh_decrypt.py         — 增量解密（WAL patch，cron 用这个）
+  prepare_runtime.py         — 共享 refresh + sync，避免多个 cron 重复跑
   collector.py               — 一次性增量同步命令
   extract_todos.py           — 提取私聊对话 + 已有 todos → JSON
   extract_calendar.py        — 提取日程 + 已有 events → JSON
   extract_digest.py          — 提取群聊消息（含 daily_done 去重）→ JSON
-  extract_trending.py        — 提取跨群热点（增量窗口模式，默认从上次扫描点继续）→ JSON
+  extract_trending.py        — 提取跨群热点（增量窗口 / 今日累计池）→ JSON
   extract_tech.py            — 提取技术讨论（含 daily_done 去重）→ JSON
   insight.py                 — 读取多天 digest JSON，输出合并数据供 LLM 分析
   extract_preferences.py     — 提取用户偏好/观点消息（关键词模式匹配）+ 写作样本 → JSON
@@ -139,7 +140,7 @@ profile/
 - **todos**: `existing_todos` 字段传给 prompt，LLM 对比已有 open items 去重。状态机：`open` → (用户说完成) → `done` → (7天后) → 自动归档
 - **calendar**: `existing_events` 字段传给 prompt，已有 pending/confirmed 不重复推送。状态机：`pending` → (用户确认) → `confirmed` → (日期已过) → `expired`
 - **digest**: 按 `daily_done` 日期去重，同一天的只跑一次
-- **trending**: `last_scan_ts` 记录上次扫描时间。**增量窗口模式**：默认从上次扫描点回补约 20 分钟到当前，首次运行回看最近 6 小时。去重靠 `existing_topics`（只推新增或明显升温的话题）。`daily_done` 仅供 trending-daily 防重复日汇总
+- **trending**: `last_scan_ts` 记录上次扫描时间。**增量窗口模式**：默认从上次扫描点回补约 20 分钟到当前，首次运行回看最近 6 小时。去重靠 `existing_topics`（只推新增或明显升温的话题）。同时会把新消息累计进 `trending_day_pool.sqlite3`，供 `trending-daily` 直接读取。`daily_done` 仅供 trending-daily 防重复日汇总
 - **tech**: 按 `daily_done` 日期去重，同一天的只跑一次
 - **insight**: `last_run_date` 防止同一天重复运行，`last_analyzed_dates` 记录已分析的 digest 日期，`run_count` 累计运行次数
 - **preference**: `last_run_date` 防止同一天重复运行，`run_count` 累计运行次数。画像存储在 `profile/servasyy_profile.json`
@@ -336,7 +337,7 @@ Hermes 通过飞书 WebSocket 网关推送 cron 结果。确保：
 #### Cron 4: 热点扫描（每小时）
 - 模板：`prompts/trending-scan.md`
 - Schedule: `0 * * * *`
-- 状态：**增量窗口模式**，默认从上次扫描点回补约 20 分钟到当前时间。只推新增或明显升温的话题，日汇总交给 `trending-daily`
+- 状态：**增量窗口模式**，默认从上次扫描点回补约 20 分钟到当前时间。只推新增或明显升温的话题，并持续累积到今日热点池；日汇总直接读取累计池
 
 #### Cron 5: 热点日汇总（每天 21:00）
 - 模板：`prompts/trending-daily.md`
@@ -412,6 +413,9 @@ python3 extract_digest.py --config config.yaml --groups "123@chatroom,456@chatro
 ```bash
 # 增量窗口模式（默认）：从上次扫描点回补约 20 分钟到当前
 python3 extract_trending.py --config config.yaml
+
+# 今日累计池（给 trending-daily 用）
+python3 extract_trending.py --config config.yaml --daily-pool --date today
 
 # 全量（指定日期）
 python3 extract_trending.py --config config.yaml --full --date 2026-03-12

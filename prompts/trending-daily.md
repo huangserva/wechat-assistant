@@ -12,18 +12,15 @@
 
 ## 执行步骤
 
-### 1. 刷新解密 + 同步消息
+### 1. 共享刷新解密 + 同步消息
 
 直接本地执行：
 
 ```bash
 cd /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts
 
-# 增量解密（WAL patch，通常 <1 秒）
-python3 refresh_decrypt.py --config /Users/serva/wechat-assistant/config.yaml
-
-# 同步到 collector.db
-python3 collector.py --config /Users/serva/wechat-assistant/config.yaml --sync
+# 日汇总开始前先确保最近 5 分钟内至少有一次成功 refresh/sync，补齐 21:00 前最新消息
+python3 prepare_runtime.py --config /Users/serva/wechat-assistant/config.yaml --refresh-max-age-sec 300 --sync-max-age-sec 300
 ```
 
 ### 2. 检查是否已汇总
@@ -39,15 +36,16 @@ print(state.get('trending', {}).get('daily_done', ''))
 
 如果输出 == 今天日期 → 已汇总过，直接终止。
 
-### 3. 全量扫描今天的数据
+### 3. 读取今日累计池
 
 ```bash
-python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml --full --date today
+python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml --daily-pool --date today
 ```
 
-> 输出 JSON 到 stdout，包含 `cross_group_topics`（跨群话题）、`trending_urls`（热门链接）、`active_groups`（活跃群）、`high_freq_keywords`（高频词）。
+> 小时级 `wechat-trending-scan` 会把增量窗口中的新消息持续累积到 `trending_day_pool.sqlite3`。
+> 这里直接读取今日累计池，并在运行时补齐尚未入池的最新消息，避免 21:00 再全量重扫全天数据。
 
-### 4. 分析 — 从全天数据中提炼热点
+### 4. 分析 — 从今日累计池中提炼热点
 
 #### 什么算热点
 - **跨群讨论的事件**（被 5+ 个群同时讨论）
@@ -103,7 +101,7 @@ python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml -
 
 ```
 ---
-🕐 cron: wechat-trending-daily · 运行于 YYYY-MM-DD HH:MM · 覆盖：今天全天 · 热点 N · 热门链接 M
+🕐 cron: wechat-trending-daily · 运行于 YYYY-MM-DD HH:MM · 数据源：今日累计池 · 热点 N · 热门链接 M
 ```
 
 ### 5.5 写入 assistant.db

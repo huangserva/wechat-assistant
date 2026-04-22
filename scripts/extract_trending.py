@@ -15,6 +15,7 @@ extract_trending.py — 从 collector.db 提取热点事件，输出 JSON（不�
 用法：
   python3 extract_trending.py --config config.yaml
   python3 extract_trending.py --config config.yaml --full --date 2026-03-12
+  python3 extract_trending.py --config config.yaml --daily-pool --date today
   python3 extract_trending.py --config config.yaml --top 30
   python3 extract_trending.py --config config.yaml --min-groups 2
   python3 extract_trending.py --config config.yaml --state /path/to/scan_state.json
@@ -22,7 +23,7 @@ extract_trending.py — 从 collector.db 提取热点事件，输出 JSON（不�
 输出 JSON 到 stdout:
 {
   "date": "2026-03-12",
-  "mode": "incremental" | "full",
+  "mode": "incremental" | "full" | "daily_pool",
   "scan_window": {"start_ts": ..., "end_ts": ...},
   "cross_group_topics": [...],
   "trending_urls": [...],
@@ -221,6 +222,8 @@ def parse_args():
     parser.add_argument('--min-count', type=int, default=5, help='关键词最少出现次数')
     parser.add_argument('--full', action='store_true', default=False,
                         help='全量模式：扫描指定日期整天（默认为增量模式）')
+    parser.add_argument('--daily-pool', action='store_true', default=False,
+                        help='从按天累积池读取热点（给日汇总用）')
     parser.add_argument('--state', default=None,
                         help='scan_state.json 路径（默认从 config 同目录推导）')
     parser.add_argument('--update-aliases', default=None,
@@ -359,64 +362,18 @@ def _extract_article_title(text):
     return None
 
 
-def main():
-    args = parse_args()
-    cfg = load_config(args.config)
-    collector_db = cfg['collector_db']
+def _resolve_day_start(date_arg, now):
+    if date_arg == 'today':
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if date_arg == 'yesterday':
+        return now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    return datetime.strptime(date_arg, '%Y-%m-%d').replace(tzinfo=_TZ8)
 
-    # ─── 确定 scan_state.json 路径并初始化 StateManager ───
-    if args.state:
-        state_path = args.state
-    else:
-        # 从 config 文件同目录推导 scan_state.json
-        config_dir = os.path.dirname(os.path.abspath(args.config))
-        state_path = os.path.join(config_dir, 'scan_state.json')
 
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, SCRIPT_DIR)
-    from state_manager import StateManager
-    sm = StateManager(state_path)
-
-    now = datetime.now(tz=_TZ8)
-    today_str = now.strftime('%Y-%m-%d')
-
-    # ─── 读取当前 state ───
-    trending_state = sm.get_trending()
-    existing_topics = trending_state.get('items', [])
-    last_scan_ts = trending_state.get('last_scan_ts', 0)
-    daily_done = trending_state.get('daily_done', '')
-    already_done_today = (daily_done == today_str)
-
-    # ─── 确定扫描时间窗口 ───
-    if args.full:
-        # 全量模式：扫描指定日期的整天（保留原始行为）
-        if args.date == 'yesterday':
-            d = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
-        else:
-            d = datetime.strptime(args.date, '%Y-%m-%d').replace(tzinfo=_TZ8)
-        ts_start = int(d.timestamp())
-        ts_end = ts_start + 86400
-        date_label = d.strftime('%Y-%m-%d')
-        mode = 'full'
-    else:
-        # 默认增量：从上次扫描点继续，回补少量时间避免漏消息
-        if last_scan_ts > 0:
-            ts_start = max(0, last_scan_ts - _TRENDING_WINDOW_OVERLAP_SECONDS)
-        else:
-            ts_start = int((now - timedelta(hours=_TRENDING_BOOTSTRAP_LOOKBACK_HOURS)).timestamp())
-        ts_end = int(now.timestamp())
-        if ts_start >= ts_end:
-            ts_start = max(0, ts_end - _TRENDING_WINDOW_OVERLAP_SECONDS)
-        date_label = today_str
-        mode = 'incremental'
-
-    # ─── 查询数据库 ───
-    conn = sqlite3.connect(collector_db)
-    conn.text_factory = lambda b: b.decode('utf-8', 'replace')
-
-    rows = conn.execute("""
+def _query_collector_rows(conn, ts_start, ts_end):
+    return conn.execute("""
         SELECT m.chatroom_id, m.sender, m.content, m.msg_time, m.msg_type,
-               w.chatroom_name
+               w.chatroom_name, COALESCE(m.local_id, CAST(m.id AS TEXT)) AS local_id
         FROM messages m
         JOIN watched_chats w ON m.chatroom_id = w.chatroom_id
         WHERE m.chatroom_id LIKE '%@chatroom'
@@ -424,13 +381,146 @@ def main():
         ORDER BY m.msg_time
     """, (ts_start, ts_end)).fetchall()
 
+
+def _pool_db_path(config_path):
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    return os.path.join(config_dir, 'trending_day_pool.sqlite3')
+
+
+def _init_pool_db(conn):
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS daily_messages (
+            day TEXT NOT NULL,
+            chatroom_id TEXT NOT NULL,
+            local_id TEXT NOT NULL,
+            sender TEXT,
+            content TEXT,
+            msg_time INTEGER,
+            msg_type INTEGER DEFAULT 1,
+            chatroom_name TEXT,
+            PRIMARY KEY (day, chatroom_id, local_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_messages_day_time
+            ON daily_messages(day, msg_time);
+        CREATE TABLE IF NOT EXISTS pool_meta (
+            day TEXT PRIMARY KEY,
+            last_collected_ts INTEGER DEFAULT 0,
+            updated_at INTEGER DEFAULT 0
+        );
+    """)
+
+
+def _update_pool_meta(conn, day_label, last_collected_ts):
+    row = conn.execute(
+        "SELECT last_collected_ts FROM pool_meta WHERE day = ?",
+        (day_label,),
+    ).fetchone()
+    merged_ts = max(int(row[0]) if row else 0, int(last_collected_ts))
+    conn.execute(
+        "INSERT OR REPLACE INTO pool_meta(day, last_collected_ts, updated_at) VALUES(?, ?, strftime('%s','now'))",
+        (day_label, merged_ts),
+    )
+
+
+def _cleanup_pool(conn, keep_days=3):
+    cutoff = (datetime.now(tz=_TZ8) - timedelta(days=keep_days)).strftime('%Y-%m-%d')
+    conn.execute("DELETE FROM daily_messages WHERE day < ?", (cutoff,))
+    conn.execute("DELETE FROM pool_meta WHERE day < ?", (cutoff,))
+
+
+def _append_pool_rows(config_path, day_label, rows, commit_start_ts, commit_end_ts):
+    if commit_end_ts <= commit_start_ts:
+        return 0
+
+    pool_rows = [row for row in rows if commit_start_ts <= row[3] < commit_end_ts]
+    conn = sqlite3.connect(_pool_db_path(config_path))
+    try:
+        _init_pool_db(conn)
+        with conn:
+            if pool_rows:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO daily_messages(
+                        day, chatroom_id, local_id, sender, content, msg_time, msg_type, chatroom_name
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            day_label,
+                            row[0],
+                            row[6],
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                        )
+                        for row in pool_rows
+                    ],
+                )
+            _update_pool_meta(conn, day_label, commit_end_ts)
+            _cleanup_pool(conn)
+        return len(pool_rows)
+    finally:
+        conn.close()
+
+
+def _backfill_pool_from_collector(config_path, collector_db, day_label, ts_end):
+    day_start = _resolve_day_start(day_label, datetime.now(tz=_TZ8))
+    day_start_ts = int(day_start.timestamp())
+
+    pool_conn = sqlite3.connect(_pool_db_path(config_path))
+    try:
+        _init_pool_db(pool_conn)
+        row = pool_conn.execute(
+            "SELECT last_collected_ts FROM pool_meta WHERE day = ?",
+            (day_label,),
+        ).fetchone()
+    finally:
+        pool_conn.close()
+
+    start_ts = max(day_start_ts, int(row[0]) if row else 0)
+    if start_ts >= ts_end:
+        return 0
+
+    collector_conn = sqlite3.connect(collector_db)
+    collector_conn.text_factory = lambda b: b.decode('utf-8', 'replace')
+    try:
+        rows = _query_collector_rows(collector_conn, start_ts, ts_end)
+    finally:
+        collector_conn.close()
+
+    return _append_pool_rows(config_path, day_label, rows, start_ts, ts_end)
+
+
+def _load_pool_rows(config_path, day_label):
+    conn = sqlite3.connect(_pool_db_path(config_path))
+    conn.text_factory = lambda b: b.decode('utf-8', 'replace')
+    try:
+        _init_pool_db(conn)
+        return conn.execute(
+            """
+            SELECT chatroom_id, sender, content, msg_time, msg_type, chatroom_name, local_id
+            FROM daily_messages
+            WHERE day = ?
+            ORDER BY msg_time
+            """,
+            (day_label,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _aggregate_trending_rows(rows, config_path, top, min_groups, min_count):
     group_names = {}
     group_msg_counts = Counter()
     url_counter = Counter()
     url_context = {}
     keyword_by_group = defaultdict(Counter)
 
-    for chatroom_id, sender, content, msg_time, msg_type, group_name in rows:
+    for chatroom_id, sender, content, msg_time, msg_type, group_name, local_id in rows:
         group_names[chatroom_id] = group_name
         group_msg_counts[chatroom_id] += 1
 
@@ -442,11 +532,11 @@ def main():
             continue
 
         urls = _extract_urls(content)
-        for u in urls:
-            url_counter[u] += 1
-            if u not in url_context:
+        for url in urls:
+            url_counter[url] += 1
+            if url not in url_context:
                 title = _extract_article_title(content)
-                url_context[u] = {
+                url_context[url] = {
                     'title': title,
                     'first_seen_group': group_name,
                     'first_seen_time': datetime.fromtimestamp(msg_time, _TZ8).strftime('%H:%M'),
@@ -461,63 +551,55 @@ def main():
                 continue
         clean = re.sub(r'https?://\S+', ' ', clean)
         clean = re.sub(r'<[^>]+>', ' ', clean)
-        clean = re.sub(r'[\U00010000-\U0010ffff]', ' ', clean)
+        clean = re.sub(r'[𐀀-􏿿]', ' ', clean)
         clean = re.sub(r'[a-zA-Z0-9_]+=\x22', ' ', clean)
-        XML_ATTRS = {'aeskey', 'cdnthumbaeskey', 'cdnthumburl', 'encryver',
+        xml_attrs = {'aeskey', 'cdnthumbaeskey', 'cdnthumburl', 'encryver',
                      'cdnthumblength', 'totallen', 'attachid', 'fileext',
                      'md5', 'hevc', 'secHashInfoBase64', 'streamvideo'}
-        if any(clean.lower().strip().startswith(x) for x in XML_ATTRS):
+        if any(clean.lower().strip().startswith(x) for x in xml_attrs):
             continue
 
         tokens = _tokenize(clean)
-        # 归一化：把同义词/子话题合并到父话题
-        normalized = [_normalize_topic(t, args.config) for t in tokens]
-        # 过滤被标记为 __IGNORE__ 的 token（人名/噪音）
-        normalized = [t for t in normalized if t != '__IGNORE__']
+        normalized = [_normalize_topic(token, config_path) for token in tokens]
+        normalized = [token for token in normalized if token != '__IGNORE__']
         keyword_by_group[chatroom_id].update(normalized)
 
-    conn.close()
-
-    # ─── 跨群话题 ───
     cross_group_kw = Counter()
     for chatroom_id, kw_counter in keyword_by_group.items():
-        for kw in kw_counter:
-            cross_group_kw[kw] += 1
+        for keyword in kw_counter:
+            cross_group_kw[keyword] += 1
 
     cross_topics = []
-    for kw, group_count in cross_group_kw.most_common(200):
-        if group_count < args.min_groups:
+    for keyword, group_count in cross_group_kw.most_common(200):
+        if group_count < min_groups:
             continue
-        if len(kw) < 2:
+        if len(keyword) < 2:
             continue
-        if kw in _STOP_WORDS:
+        if keyword in _STOP_WORDS:
             continue
-        # 过滤泛化大类词（单 token 形式），但保留 bigram 如 "claude mythos"
-        kw_lower = kw.lower()
-        if ' ' not in kw and kw_lower in _GENERIC_WORDS:
+        keyword_lower = keyword.lower()
+        if ' ' not in keyword and keyword_lower in _GENERIC_WORDS:
             continue
-        total_mentions = sum(keyword_by_group[g][kw] for g in keyword_by_group)
-        if total_mentions < args.min_count:
+        total_mentions = sum(keyword_by_group[group][keyword] for group in keyword_by_group)
+        if total_mentions < min_count:
             continue
         source_groups = []
-        for g, kc in keyword_by_group.items():
-            if kw in kc and kc[kw] >= 2:
-                source_groups.append(group_names.get(g, g))
-        # 标记是否经过归一化
-        all_aliases = _get_all_aliases(args.config)
-        normalized = (kw != all_aliases.get(kw.lower().strip(), kw))
+        for group, kw_counter in keyword_by_group.items():
+            if keyword in kw_counter and kw_counter[keyword] >= 2:
+                source_groups.append(group_names.get(group, group))
+        all_aliases = _get_all_aliases(config_path)
+        normalized = (keyword != all_aliases.get(keyword.lower().strip(), keyword))
         cross_topics.append({
-            'keyword': kw,
+            'keyword': keyword,
             'groups_count': group_count,
             'total_mentions': total_mentions,
             'source_groups': source_groups[:10],
             'is_merged': normalized,
         })
-    cross_topics = cross_topics[:args.top]
+    cross_topics = cross_topics[:top]
 
-    # ─── 热门 URL ───
     trending_urls = []
-    for url, count in url_counter.most_common(args.top):
+    for url, count in url_counter.most_common(top):
         if count < 2:
             break
         ctx = url_context.get(url, {})
@@ -529,10 +611,9 @@ def main():
             'first_seen_time': ctx.get('first_seen_time', ''),
         })
 
-    # ─── 活跃群 ───
     active_groups = []
     avg_msgs = sum(group_msg_counts.values()) / max(len(group_msg_counts), 1)
-    for gid, count in group_msg_counts.most_common(args.top):
+    for gid, count in group_msg_counts.most_common(top):
         if count < max(avg_msgs * 2, 10):
             continue
         active_groups.append({
@@ -542,35 +623,114 @@ def main():
             'avg_daily': round(avg_msgs, 1),
         })
 
-    # ─── 高频关键词 ───
     all_kw = Counter()
-    for kc in keyword_by_group.values():
-        all_kw.update(kc)
+    for kw_counter in keyword_by_group.values():
+        all_kw.update(kw_counter)
     high_freq = []
-    for kw, count in all_kw.most_common(args.top * 3):
-        if len(kw) < 2 or kw in _STOP_WORDS or count < args.min_count:
+    for keyword, count in all_kw.most_common(top * 3):
+        if len(keyword) < 2 or keyword in _STOP_WORDS or count < min_count:
             continue
-        # 过滤泛化大类词
-        kw_lower = kw.lower()
-        if ' ' not in kw and kw_lower in _GENERIC_WORDS:
+        keyword_lower = keyword.lower()
+        if ' ' not in keyword and keyword_lower in _GENERIC_WORDS:
             continue
-        groups_with_kw = sum(1 for kc in keyword_by_group.values() if kw in kc)
-        # 过滤只在1个群出现、不在归一化映射中的纯小写长词（大概率是用户名/人名）
-        if groups_with_kw <= 1 and re.match(r'^[a-z]{4,}$', kw) and kw not in _TOPIC_ALIASES:
+        groups_with_kw = sum(1 for kw_counter in keyword_by_group.values() if keyword in kw_counter)
+        if groups_with_kw <= 1 and re.match(r'^[a-z]{4,}$', keyword) and keyword not in _TOPIC_ALIASES:
             continue
         high_freq.append({
-            'keyword': kw,
+            'keyword': keyword,
             'count': count,
             'groups': groups_with_kw,
         })
-        if len(high_freq) >= args.top:
+        if len(high_freq) >= top:
             break
 
-    # ─── 更新 state ───
-    sm.update_trending(cross_topics, ts_end)
-    sm.cleanup_old_trending(days=3)
+    return {
+        'total_groups': len(group_msg_counts),
+        'total_messages': sum(group_msg_counts.values()),
+        'cross_group_topics': cross_topics,
+        'trending_urls': trending_urls,
+        'active_groups': active_groups,
+        'high_freq_keywords': high_freq,
+    }
 
-    # ─── 更新学习层映射（如果 LLM 提供了新的 alias） ───
+
+def main():
+    args = parse_args()
+    if args.full and args.daily_pool:
+        print('[ERROR] --full 和 --daily-pool 不能同时使用', file=sys.stderr)
+        sys.exit(1)
+
+    cfg = load_config(args.config)
+    collector_db = cfg['collector_db']
+
+    if args.state:
+        state_path = args.state
+    else:
+        config_dir = os.path.dirname(os.path.abspath(args.config))
+        state_path = os.path.join(config_dir, 'scan_state.json')
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, script_dir)
+    from state_manager import StateManager
+    sm = StateManager(state_path)
+
+    now = datetime.now(tz=_TZ8)
+    today_str = now.strftime('%Y-%m-%d')
+    today_start_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+    trending_state = sm.get_trending()
+    existing_topics = trending_state.get('items', [])
+    last_scan_ts = trending_state.get('last_scan_ts', 0)
+    daily_done = trending_state.get('daily_done', '')
+    already_done_today = (daily_done == today_str)
+
+    pool_appended_rows = 0
+    pool_backfilled_rows = 0
+
+    if args.daily_pool:
+        day_start = _resolve_day_start(args.date, now)
+        date_label = day_start.strftime('%Y-%m-%d')
+        ts_start = int(day_start.timestamp())
+        if date_label == today_str:
+            ts_end = int(now.timestamp())
+            pool_backfilled_rows = _backfill_pool_from_collector(args.config, collector_db, date_label, ts_end)
+        else:
+            ts_end = ts_start + 86400
+        rows = _load_pool_rows(args.config, date_label)
+        mode = 'daily_pool'
+    else:
+        if args.full:
+            day_start = _resolve_day_start(args.date, now)
+            ts_start = int(day_start.timestamp())
+            ts_end = ts_start + 86400
+            date_label = day_start.strftime('%Y-%m-%d')
+            mode = 'full'
+        else:
+            if last_scan_ts > 0:
+                ts_start = max(0, last_scan_ts - _TRENDING_WINDOW_OVERLAP_SECONDS)
+            else:
+                ts_start = int((now - timedelta(hours=_TRENDING_BOOTSTRAP_LOOKBACK_HOURS)).timestamp())
+            ts_end = int(now.timestamp())
+            if ts_start >= ts_end:
+                ts_start = max(0, ts_end - _TRENDING_WINDOW_OVERLAP_SECONDS)
+            date_label = today_str
+            mode = 'incremental'
+
+        conn = sqlite3.connect(collector_db)
+        conn.text_factory = lambda b: b.decode('utf-8', 'replace')
+        try:
+            rows = _query_collector_rows(conn, ts_start, ts_end)
+        finally:
+            conn.close()
+
+    aggregated = _aggregate_trending_rows(rows, args.config, args.top, args.min_groups, args.min_count)
+
+    if mode == 'incremental':
+        commit_start_ts = max(today_start_ts, int(last_scan_ts or 0))
+        pool_appended_rows = _append_pool_rows(args.config, date_label, rows, commit_start_ts, ts_end)
+        sm.update_trending(aggregated['cross_group_topics'], ts_end)
+        sm.cleanup_old_trending(days=3)
+
     if args.update_aliases:
         config_dir = os.path.dirname(os.path.abspath(args.config))
         learned_path = os.path.join(config_dir, 'learned_aliases.json')
@@ -580,15 +740,14 @@ def main():
             if not isinstance(new_aliases, dict):
                 new_aliases = {'aliases': new_aliases}
             aliases_to_add = new_aliases.get('aliases', new_aliases)
-            
-            # 加载现有
+
             existing = _load_learned_aliases(args.config)
             added = 0
-            for k, v in aliases_to_add.items():
-                if k not in existing and k not in _TOPIC_ALIASES:
-                    existing[k] = v
+            for key, value in aliases_to_add.items():
+                if key not in existing and key not in _TOPIC_ALIASES:
+                    existing[key] = value
                     added += 1
-            
+
             if added > 0:
                 learned_data = {
                     'aliases': existing,
@@ -604,7 +763,6 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to update aliases: {e}", file=sys.stderr)
 
-    # ─── 输出 ───
     output = {
         'date': date_label,
         'mode': mode,
@@ -614,18 +772,23 @@ def main():
             'start_time': datetime.fromtimestamp(ts_start, _TZ8).strftime('%Y-%m-%d %H:%M:%S'),
             'end_time': datetime.fromtimestamp(ts_end, _TZ8).strftime('%Y-%m-%d %H:%M:%S'),
         },
-        'total_groups': len(group_msg_counts),
-        'total_messages': sum(group_msg_counts.values()),
-        'cross_group_topics': cross_topics,
-        'trending_urls': trending_urls,
-        'active_groups': active_groups,
-        'high_freq_keywords': high_freq,
+        'total_groups': aggregated['total_groups'],
+        'total_messages': aggregated['total_messages'],
+        'cross_group_topics': aggregated['cross_group_topics'],
+        'trending_urls': aggregated['trending_urls'],
+        'active_groups': aggregated['active_groups'],
+        'high_freq_keywords': aggregated['high_freq_keywords'],
         'existing_topics': existing_topics,
         'already_done_today': already_done_today,
         'scan_state_path': state_path,
         'topic_aliases': {
             'seed_count': len(_TOPIC_ALIASES),
             'learned_count': len(_load_learned_aliases(args.config)) if args.config else 0,
+        },
+        'daily_pool': {
+            'path': _pool_db_path(args.config),
+            'appended_rows': pool_appended_rows,
+            'backfilled_rows': pool_backfilled_rows,
         },
     }
 

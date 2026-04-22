@@ -12,19 +12,16 @@
 
 ## 执行步骤
 
-### 1. 刷新解密 + 同步消息
+### 1. 共享刷新解密 + 同步消息
 
 直接本地执行：
 
 ```bash
 cd /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts
 
-# 增量解密（WAL patch，通常 <1 秒）
-# 如果退出码=2，表示密钥过期（微信重启过），发告警后终止
-python3 refresh_decrypt.py --config /Users/serva/wechat-assistant/config.yaml
-
-# 同步到 collector.db
-python3 collector.py --config /Users/serva/wechat-assistant/config.yaml --sync
+# tech-scan 是日级摘要，允许复用 30 分钟内的最近一次成功 refresh/sync
+# 如果 refresh 退出码=2，表示密钥过期（微信重启过），发告警后终止
+python3 prepare_runtime.py --config /Users/serva/wechat-assistant/config.yaml --refresh-max-age-sec 1800 --sync-max-age-sec 1800
 ```
 
 > **如果 `refresh_decrypt.py` 输出包含 "HMAC 验证失败" 或退出码为 2：**
