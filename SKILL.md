@@ -207,6 +207,7 @@ todo-scan (低频触发，最多每4小时一次)
 
 preference-scan cron (每天 23:00)
   → 读取最近 7 天 preferences/*.json 增量归档
+  → 合并累计的 preferences + writing_samples（去重后最多抽样 120 条写作样本）
   → LLM 深度分析5个维度（技术、商业、决策、沟通、写作风格）
   → 增量合并到 profile/servasyy_profile.json
   → 更新 scan_state.json (preference.last_run_date)

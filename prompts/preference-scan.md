@@ -2,7 +2,7 @@
 
 ## 任务
 
-运行 extract_preferences.py 提取最近 7 天的偏好消息，结合 AI 深度分析，更新用户画像，推送到飞书。
+读取最近 7 天 `preferences/*.json` 的累计归档，真正带上累计下来的 `preferences + writing_samples`，结合 AI 深度分析，更新用户画像，推送到飞书。
 
 ## 执行步骤
 
@@ -24,7 +24,7 @@ print(f'USER_CONTEXT={context}')
 
 ```bash
 python3 -c "
-import json, os, glob, datetime
+import json, os, datetime
 
 pref_dir = '/Users/serva/wechat-assistant/preferences'
 today = datetime.date.today()
@@ -35,27 +35,90 @@ for i in range(7):
     if os.path.exists(p):
         files.append(p)
 
+def dedupe_preferences(items):
+    seen = set()
+    out = []
+    for item in sorted(items, key=lambda x: x.get('msg_time', 0)):
+        key = (item.get('chatroom_id', ''), item.get('msg_time', 0), item.get('content', ''))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+def dedupe_writing_samples(samples):
+    seen = set()
+    out = []
+    for item in sorted(samples, key=lambda x: x.get('msg_time', 0)):
+        key = (item.get('msg_time', 0), item.get('content', ''))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+def sample_evenly(items, limit=120):
+    if len(items) <= limit:
+        return items
+    if limit <= 1:
+        return [items[-1]]
+    step = (len(items) - 1) / float(limit - 1)
+    picked = []
+    used = set()
+    for i in range(limit):
+        idx = round(i * step)
+        if idx in used:
+            continue
+        used.add(idx)
+        picked.append(items[idx])
+    return picked
+
 if not files:
-    print(json.dumps({'stats': {'preference_count': 0, 'writing_samples_count': 0}}))
+    print(json.dumps({
+        'stats': {
+            'preference_count': 0,
+            'writing_samples_count': 0,
+            'writing_samples_total': 0,
+        },
+        'preferences': [],
+        'writing_samples': [],
+        'files': []
+    }, ensure_ascii=False))
 else:
-    # 合并所有天
     all_prefs = []
-    total_samples = 0
+    all_samples = []
     for f in sorted(files):
-        with open(f) as fh:
+        with open(f, encoding='utf-8') as fh:
             data = json.load(fh)
         all_prefs.extend(data.get('preferences', []))
-        total_samples = max(total_samples, data.get('stats', {}).get('writing_samples_count', 0))
+        sample_meta = data.get('writing_samples_meta', [])
+        if sample_meta:
+            all_samples.extend(sample_meta)
+        else:
+            for content in data.get('writing_samples', []):
+                all_samples.append({'content': content, 'msg_time': 0, 'time': ''})
+
+    all_prefs = dedupe_preferences(all_prefs)
+    all_samples = dedupe_writing_samples(all_samples)
+    sampled_samples = sample_evenly(all_samples, limit=120)
+
     print(json.dumps({
-        'stats': {'preference_count': len(all_prefs), 'writing_samples_count': total_samples},
+        'stats': {
+            'preference_count': len(all_prefs),
+            'writing_samples_count': len(sampled_samples),
+            'writing_samples_total': len(all_samples),
+        },
         'preferences': all_prefs,
+        'writing_samples': [item.get('content', '') for item in sampled_samples],
+        'writing_samples_meta': sampled_samples,
         'files': files
     }, ensure_ascii=False))
 "
 ```
 
-> 输出 JSON：最近 7 天的归档偏好数据。
-> **如果 preference_count 为 0**：直接终止，不发消息。
+> 输出 JSON：最近 7 天的累计归档偏好数据，**真正包含 `writing_samples`**。
+> 为控制 token，`writing_samples` 会先去重，再最多均匀抽样 120 条；`writing_samples_total` 表示累计总量。
+> **如果 `preference_count == 0` 且 `writing_samples_count == 0`**：直接终止，不发消息。
 
 ### 3. 检查是否需要运行
 
@@ -86,7 +149,7 @@ else:
 
 ### 5. AI 深度分析
 
-基于提取的 preferences 和 writing_samples，结合现有画像，进行以下分析：
+基于提取的 `preferences` 和累计归档后的 `writing_samples`，结合现有画像，进行以下分析：
 
 #### 5.1 技术偏好分析
 - 编程语言/框架偏好（倾向什么、回避什么）
@@ -111,7 +174,7 @@ else:
 - 情绪模式（在什么情境下表达什么情绪）
 
 #### 5.5 写作风格
-- 从 writing_samples 分析：
+- 从累计归档并抽样后的 `writing_samples` 分析：
   - 平均句长
   - 用词偏好（口语化程度、专业术语密度）
   - 标点使用习惯
@@ -253,7 +316,7 @@ sm2.update_user_state({
 
 ---
 
-📊 本期分析：偏好消息 N 条 · 写作样本 M 条 · 覆盖 7 天
+📊 本期分析：偏好消息 N 条 · 写作样本 M 条（累计 T 条） · 覆盖 7 天
 ```
 
 如果画像没有实质性变化（只是确认已有结论），简化报告为：
@@ -261,7 +324,7 @@ sm2.update_user_state({
 🧑 **用户画像确认（MM.DD）**
 无新增偏好发现。现有画像 N 个维度，M 个结论保持不变。
 
-📊 本期分析：偏好消息 N 条 · 写作样本 M 条
+📊 本期分析：偏好消息 N 条 · 写作样本 M 条（累计 T 条）
 ```
 
 ### 8. 写入 assistant.db
@@ -279,5 +342,5 @@ python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_wri
 
 ```
 ---
-🕐 cron: wechat-preference-scan · 运行于 YYYY-MM-DD HH:MM · 偏好消息 N · 写作样本 M · 画像维度 D · 状态: {USER_STATUS}
+🕐 cron: wechat-preference-scan · 运行于 YYYY-MM-DD HH:MM · 偏好消息 N · 写作样本 M（累计 T） · 画像维度 D · 状态: {USER_STATUS}
 ```
