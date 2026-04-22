@@ -42,7 +42,8 @@ print(f'USER_CONTEXT={context}')
 python3 extract_calendar.py --config /Users/serva/wechat-assistant/config.yaml
 ```
 
-> 输出 JSON 到 stdout，包含按对话分组的消息、`existing_events`（来自 scan_state.json）和 `scan_state_path`。
+> 默认是**增量窗口模式**：从上次 `calendar.last_scan_ts` 往前回补约 20 分钟到当前时间；首次运行回看最近 24 小时。
+> 输出 JSON 到 stdout，包含按对话分组的消息、`existing_events`（来自 `scan_state.json`）、`scan_state_path` 和 `scan_window`。
 
 ### 4. 分析 JSON 输出
 
@@ -91,7 +92,7 @@ with open(state_path) as f:
 # 更新 calendar items
 # 保留 existing 中未过期的 + 新发现的
 # 过期的标记 status='expired'
-state['calendar']['last_scan_ts'] = int(time.time())
+state['calendar']['last_scan_ts'] = int(time.time())  # 即本轮 scan_window.end_ts
 
 with open(state_path, 'w') as f:
     json.dump(state, f, ensure_ascii=False, indent=2)

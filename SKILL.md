@@ -388,14 +388,14 @@ python3 extract_todos.py --config config.yaml --full
 ### 提取日程数据
 
 ```bash
-# 增量（最近 90 分钟，含已有 pending/confirmed 事件）
+# 增量（默认从上次扫描点继续，带约 20 分钟回补）
 python3 extract_calendar.py --config config.yaml
 
 # 全量
 python3 extract_calendar.py --config config.yaml --full
 ```
 
-输出包含 `existing_events` 供 prompt 对比去重。
+输出包含 `existing_events` 和 `scan_window`，供 prompt 对比去重并展示扫描范围。
 
 ### 提取群聊干货
 
@@ -567,11 +567,12 @@ Agent 如果发现 `refresh_decrypt.py` 报错（HMAC 验证失败），应主�
 
 **症状**: cron extract_todos/calendar 报告 "0 条会话"，但用户确实有私聊。
 
-**原因**: 增量模式扫描"最近 90 分钟"。如果 gateway 重启打断了 cron 周期，错过一次 tick，消息就可能超出窗口被漏掉。
+**原因**: 旧版 calendar 只看固定时间窗；如果 gateway 重启打断 cron 周期，错过一次 tick，消息可能落在窗口外。
 
 **已应用的修复**:
-1. 窗口已从 35 分钟改为 **90 分钟**（窗口 >= cron间隔×2 + 缓冲）
-2. **状态管理**：`scan_state.json` 记录 `last_scan_ts`，即使某次 cron 漏掉，下次仍从上次位置开始扫描
+1. todo / calendar 都改为 **状态驱动增量扫描**，由 `scan_state.json` 记录 `last_scan_ts`
+2. 每次会从上次扫描点向前回补一小段时间，避免边界漏消息
+3. calendar 首次运行回看最近 24 小时，避免刚启用时漏掉当天约会信息
 
 **排查**:
 ```bash

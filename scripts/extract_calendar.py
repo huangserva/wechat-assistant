@@ -5,7 +5,7 @@ extract_calendar.py — 从 collector.db 提取可能含日程的对话，输出
 扫描私聊 + 工作群消息，过滤噪音后输出结构化 JSON 供 Agent 分析。
 
 用法：
-  python3 extract_calendar.py --config config.yaml           # 增量：最近 35 分钟
+  python3 extract_calendar.py --config config.yaml           # 增量：默认从上次扫描点继续（带少量回补）
   python3 extract_calendar.py --config config.yaml --full     # 全量：昨天整天
 
 输出 JSON 到 stdout:
@@ -15,6 +15,7 @@ extract_calendar.py — 从 collector.db 提取可能含日程的对话，输出
     {"chatroom_id": "...", "contact_name": "...", "type": "dm|group", "messages": [...]}
   ],
   "existing_events": [...],
+  "scan_window": {"start_time": "2026-04-22 09:00:00", "end_time": "2026-04-22 13:00:00"},
   "scan_state_path": "..."
 }
 """
@@ -26,6 +27,8 @@ import argparse
 from datetime import datetime, timezone, timedelta
 
 _TZ8 = timezone(timedelta(hours=8))
+_CALENDAR_BOOTSTRAP_LOOKBACK_HOURS = 24
+_CALENDAR_WINDOW_OVERLAP_SECONDS = 20 * 60
 
 # 每段对话保留的最大消息数
 MAX_MESSAGES_PER_CONV = 20
@@ -116,8 +119,14 @@ def main():
         until = int(today_0.timestamp())
         mode = 'full'
     else:
-        since = now_ts - 90 * 60  # 与 todo 一致，用 90 分钟窗口
+        last_scan_ts = sm.get_calendar_last_scan_ts()
+        if last_scan_ts > 0:
+            since = max(0, last_scan_ts - _CALENDAR_WINDOW_OVERLAP_SECONDS)
+        else:
+            since = int((now - timedelta(hours=_CALENDAR_BOOTSTRAP_LOOKBACK_HOURS)).timestamp())
         until = now_ts
+        if since >= until:
+            since = max(0, until - _CALENDAR_WINDOW_OVERLAP_SECONDS)
         mode = 'incremental'
 
     conn = sqlite3.connect(collector_db)
@@ -256,6 +265,12 @@ def main():
         'scan_time': now_ts,
         'scanned_since': since,
         'scanned_until': until,
+        'scan_window': {
+            'start_ts': since,
+            'end_ts': until,
+            'start_time': datetime.fromtimestamp(since, tz=_TZ8).strftime('%Y-%m-%d %H:%M:%S'),
+            'end_time': datetime.fromtimestamp(until, tz=_TZ8).strftime('%Y-%m-%d %H:%M:%S'),
+        },
         'scan_mode': mode,
         'conversations': conv_list,
         'total_messages': total_messages,
