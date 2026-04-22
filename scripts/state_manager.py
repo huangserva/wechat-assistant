@@ -366,6 +366,83 @@ class StateManager:
 
         return 'idle', '无活跃活动'
 
+    def set_user_status(self, status, context='', source='user_set'):
+        """手动设置用户状态。
+
+        Args:
+            status: 状态值 (online/offline/busy/idle/working 等)
+            context: 状态描述/上下文信息
+            source: 状态来源，默认 'user_set'；传 'inferred' 则视为推断
+
+        Returns:
+            更新后的完整 state 字典
+        """
+        from datetime import datetime, timezone
+
+        state = self._read()
+        current = state.setdefault('current', {})
+
+        now = datetime.now(timezone.utc).isoformat()
+        current['status'] = status
+        current['context'] = context
+        current['source'] = source
+        current['last_active'] = now
+
+        # 如果是手动设置（非 inferred），记录 manual_set_at 时间戳
+        if source != 'inferred':
+            current['manual_set_at'] = now
+        else:
+            current.pop('manual_set_at', None)
+
+        self._write(state)
+        return state
+
+    def check_manual_status_expiry(self, hours=4):
+        """检查手动设置的状态是否已过期。
+
+        如果 current.source == 'user_set' 且 manual_set_at 距今超过 hours 小时，
+        则恢复为 inferred 模式并重新推断真实状态。
+
+        Args:
+            hours: 过期时长（小时），默认 4 小时
+
+        Returns:
+            (expired: bool, new_status: str, new_context: str)
+        """
+        from datetime import datetime, timezone, timedelta
+
+        state = self._read()
+        current = state.get('current', {})
+        source = current.get('source', 'inferred')
+        manual_set_at_str = current.get('manual_set_at')
+
+        # 仅当来源为 user_set 且存在 manual_set_at 时才检查
+        if source != 'user_set' or not manual_set_at_str:
+            return False, current.get('status', 'idle'), current.get('context', '')
+
+        try:
+            manual_set_at = datetime.fromisoformat(manual_set_at_str)
+            if manual_set_at.tzinfo is None:
+                manual_set_at = manual_set_at.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if now - manual_set_at <= timedelta(hours=hours):
+                # 尚未过期
+                return False, current.get('status', 'idle'), current.get('context', '')
+        except (ValueError, TypeError):
+            # 时间戳解析失败，视为需要重新推断
+            pass
+
+        # 已过期 → 恢复 inferred 模式，重新推断
+        new_status, new_context = self.infer_user_status()
+        current['status'] = new_status
+        current['context'] = new_context
+        current['source'] = 'inferred'
+        current.pop('manual_set_at', None)
+        current['last_active'] = datetime.now(timezone.utc).isoformat()
+        self._write(state)
+
+        return True, new_status, new_context
+
     # ─── General ─────────────────────────────────────────────
 
     def get_full_state(self):

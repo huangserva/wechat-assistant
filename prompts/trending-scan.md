@@ -1,4 +1,4 @@
-# 热点扫描 — Cron Prompt（每小时，今日累计）
+# 热点扫描 — Cron Prompt（每小时，今日累计）（决策脑 v2）
 
 ## 任务
 
@@ -25,7 +25,21 @@ python3 collector.py --config /Users/serva/wechat-assistant/config.yaml --sync
 > 发飞书告警：`⚠️ 微信密钥已过期，需要重新提取。请运行 sudo find_all_keys_macos`
 > 然后**终止本次任务**，不继续后续步骤。
 
-### 2. 提取今日热点数据
+### 2. 感知用户状态（Layer A）
+
+```bash
+python3 -c "
+import sys
+sys.path.insert(0, '/Users/serva/.hermes/skills/social-media/wechat-assistant/scripts')
+from state_manager import StateManager
+sm = StateManager('/Users/serva/wechat-assistant/scan_state.json')
+status, context = sm.infer_user_status()
+print(f'USER_STATUS={status}')
+print(f'USER_CONTEXT={context}')
+"
+```
+
+### 3. 提取今日热点数据
 
 ```bash
 python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml
@@ -62,7 +76,14 @@ python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml
 
 > **注意**：`cross_group_topics` 可能包含大量**碎片 bigram 噪音**（同一句话被多群转发时，其所有子串都出现在跨群列表中）。例如 "我昨天给大家发了我做的效果" 在 6 群出现，则 "我昨天给"、"昨天给大"、"天给大家" 等所有子串都会出现，groups_count 相同。**过滤方法**：只保留有意义的话题关键词，忽略明显是句子碎片的条目（含常见动词/助词组合、缺乏语义完整性的片段）。
 
-### 3. 分析 JSON 输出 — 做话题归纳，不要直接搬运 keyword
+### 4. 分析 JSON 输出 — 做话题归纳，不要直接搬运 keyword
+
+**⚠️ 身份与事实准确性（最高优先级）：**
+- 消息中 sender=`__self__` 的是**用户本人（黄宗宁）**，是一个 AI Agent 爱好者/开发者，**不是**任何公司创始人
+- **严禁编造人物身份**。不要把用户本人关联为任何公司/产品的创始人、高管或负责人
+- 讨论某个产品 ≠ 创始人。如果看到用户在讨论 Kimi/Claude/GPT 等产品，那只是用户在讨论，不是"创始人解读"
+- 描述人物时只用消息中明确出现的身份信息，不猜测不推断
+- 如果某个话题只是用户转发/评论了别人的内容，如实描述为"用户分享了/讨论了"，不要加戏
 
 **重要：keyword 字段是自动提取的 token/bigram，不是最终话题。你需要归纳。**
 
@@ -87,9 +108,9 @@ python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml
 - 广告、推销、拉票
 - **碎片 bigram**：同一句话被多群转发产生的子串（如 "发布了很猛" 产生 "发布了很"、"布了很猛" 等），表现为多个条目 groups_count 完全相同、关键词是较长条目的子串
 
-### 3.5 话题归类学习（自动更新 learned_aliases.json）
+### 4.5 话题归类学习（自动更新 learned_aliases.json）
 
-分析步骤 2 输出中的 `cross_group_topics` 和 `high_freq_keywords`，识别**应该合并但尚未合并的关键词**。
+分析步骤 3 输出中的 `cross_group_topics` 和 `high_freq_keywords`，识别**应该合并但尚未合并的关键词**。
 
 规则：
 - 同一个产品/概念的不同叫法（如 "dify" → "Dify", "comfyui" → "ComfyUI"）
@@ -110,11 +131,11 @@ python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml -
 
 > **不需要每次都学习**。只有在发现明显应该合并的关键词时才操作。如果没有新发现，跳过此步骤。
 
-### 4. 静默时间
+### 5. 静默时间
 
 **23:00 ~ 08:00 不推送飞书**。但 state 照常更新。
 
-### 5. 推送到飞书（仅在有新热点时）
+### 6. 推送到飞书（仅在有新热点时）
 
 格式：
 ```
@@ -153,7 +174,7 @@ python3 extract_trending.py --config /Users/serva/wechat-assistant/config.yaml -
 🔥 wechat-trending-scan · YYYY-MM-DD HH:MM · 今日累计 00:00~HH:MM · 无显著热点 · 活跃群: X · 消息: Y
 ```
 
-### 5.2 写入 assistant.db
+### 6.2 写入 assistant.db
 
 将本次热点扫描结果写入 SQLite 数据库：
 
@@ -168,15 +189,15 @@ python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_wri
 python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_writer.py --db ~/wechat-assistant/assistant.db --scan-log "trending:ok:X群Y条|top话题摘要"
 ```
 
-### 5.5 状态栏
+### 6.5 状态栏
 
 有热点时，在推送正文末尾加上状态栏：
 
 ```
 ---
-🕐 cron: wechat-trending-scan · 运行于 YYYY-MM-DD HH:MM · 今日累计 00:00~HH:MM · 活跃群 X · 消息 Y 条
+🕐 cron: wechat-trending-scan · 运行于 YYYY-MM-DD HH:MM · 今日累计 00:00~HH:MM · 活跃群 X · 消息 Y 条 · 状态: {USER_STATUS}
 ```
 
-### 6. 更新 scan_state.json
+### 7. 更新 scan_state.json
 
 extract_trending.py 已自动更新 `trending.last_scan_ts`，无需额外操作。

@@ -33,13 +33,28 @@ allowed-tools: terminal, read_file, write_file, patch, search_files
 
 ## Architecture
 
-两层设计：
+三层设计：
 
 ### Layer 1: 独立 CLI 工具（scripts/ 目录）
 纯 Python，不依赖 OpenClaw，任何人都能用。只做数据提取输出 JSON，**不调 AI API**。
 
 ### Layer 2: Hermes Skill（本文件 + prompts/）
 Agent 读 prompt 模板，调 CLI 拿 JSON，分析后推送到飞书（Feishu）。
+
+### Layer 3: 决策脑（Decision Brain v2）
+在 Layer 2 基础上增加三个子层，让推送更智能：
+
+| 子层 | 功能 | 实现 |
+|------|------|------|
+| **Layer A** 用户状态感知 | 推断用户当前状态（sleeping/busy/working/idle），支持手动设置 | `state_manager.py` 的 `infer_user_status()` + `set_user_status()` + `user_state.json` |
+| **Layer B** 推送优先级 | 按紧急程度排序（🔴🟡🟢⚪），结合用户状态动态调整 | 各 cron prompt 中的优先级评估段 |
+| **Layer C** 反馈闭环 | 记录推送反馈，追踪用户是否 acted/ignored，自动调频 | `push_feedback` 表 + acknowledged 机制 + preference-scan 反馈分析 |
+
+**Acknowledged 机制：** 新 todo 标记 `acknowledged=false`（显示 🔔），2小时后自动确认（变为 🟢）。展示保持全部 open todo 列出，不隐藏旧项。
+
+**手动状态设置：** 用户在飞书回复状态指令（"我在开会"/"busy"→busy, "勿扰"→unavailable, "我在休息"→idle, "恢复"→回到自动推断），4小时后自动过期恢复推断模式。`state_manager.py` 的 `set_user_status()` + `check_manual_status_expiry()` 实现。
+
+**反馈分析（每天23:00）：** preference-scan 读取近7天 push_feedback 数据，分析各类推送的 ignore_rate / 最佳推送时段 / 优先级准确度，结果写入 `user_state.json` 的 `feedback_stats` 和 `patterns` 字段。数据积累不足时跳过。
 
 ## File Structure
 
@@ -62,14 +77,14 @@ scripts/
   extract_preferences.py     — 提取用户偏好/观点消息（关键词模式匹配）+ 写作样本 → JSON
   requirements.txt           — Python 依赖
 prompts/
-  todo-scan.md               — 待办扫描 cron prompt（含状态对比逻辑）
-  calendar-scan.md           — 日程扫描 cron prompt（含状态对比逻辑）
-  digest.md                  — 干货收集 cron prompt（含 daily_done 检查 + JSON 存档）
-  trending-scan.md           — 热点扫描 cron prompt（今日累计模式，每小时，从今天 00:00 到现在）
+  todo-scan.md               — 待办扫描 cron prompt（决策脑 v2：Layer A 状态感知 + acknowledged + 优先级排序）
+  calendar-scan.md           — 日程扫描 cron prompt（决策脑 v2：Layer A + 优先级排序）
+  digest.md                  — 干货收集 cron prompt（决策脑 v2：含 daily_done 检查 + JSON 存档）
+  trending-scan.md           — 热点扫描 cron prompt（决策脑 v2：今日累计模式，每小时）
   trending-daily.md          — 热点日汇总 cron prompt（每天 21:00）
-  tech-scan.md               — 技术讨论 cron prompt（含 daily_done 检查）
+  tech-scan.md               — 技术讨论 cron prompt（决策脑 v2：含 daily_done 检查）
   insight.md                 — 洞察分析 cron prompt（每3天，话题关联+群画像）
-  preference-scan.md         — 用户偏好画像 cron prompt（每天，技术/商业/决策/沟通/写作分析）
+  preference-scan.md         — 用户偏好画像 cron prompt（决策脑 v2：每天，技术/商业/决策/沟通/写作分析）
 config.example.yaml          — 配置模板
 ```
 
@@ -77,6 +92,7 @@ config.example.yaml          — 配置模板
 ```
 assistant.db      — 结构化数据库（SQLite，9张表，跨 cron 查询 + 历史追踪）
 scan_state.json   — 统一状态文件（5个分类的去重状态 + items）
+user_state.json   — 用户状态感知（Layer A：current/schedule/patterns/feedback_stats）
 todos.json        — 旧格式待办文件（仅首次迁移用，之后用 scan_state.json）
 collector.db      — 采集的 SQLite 数据库
 config.yaml       — 配置文件
@@ -746,13 +762,100 @@ python3 $SKILL/extract_tech.py --config $CFG --date yesterday | python3 -c "impo
 - **messages 表没有 chatroom_name 列**：查询需要 JOIN watched_chats：`SELECT w.chatroom_name, m.content FROM messages m JOIN watched_chats w ON m.chatroom_id = w.chatroom_id WHERE ...`。直接 `SELECT chatroom_name FROM messages` 会报 `no such column`。
 - **terminal 中管道 + python -c 会被安全扫描拦截**：`cat file | python3 -c "..."` 会触发 `[HIGH] Pipe to interpreter` 安全告警并被阻止。改用 write_file 写脚本到 /tmp/ 再执行，或在 execute_code 中直接用 read_file + json.loads。
 
+## 决策脑开发 Pitfalls
+
+1. **db_writer.py 新增表**：函数定义必须在 `_TABLE_WRITERS` 字典之前，或用延迟注册模式（`_TABLE_WRITERS['new_table'] = write_new_table` 放在函数定义之后）。直接在 dict 里写 `None` 会导致 CLI 报 "Unknown table"。
+2. **Shell 内联 Python**：复杂的 Python 代码不要用 `python3 -c "..."` 内联（引号嵌套必炸），写到 `/tmp/` 脚本文件再执行更可靠。
+3. **数据迁移**：给现有数据加新字段（如 `acknowledged`）时，必须回填已有记录的默认值（`acknowledged=true`），否则已有的 open items 会全部显示为 🔔 新消息。
+4. **user_state.json 初始化**：`get_user_state()` 只读不创建。需要 `update_user_state()` 或手动 `write_file` 才会创建文件。
+5. **多 prompt 批量改编号**：用 `delegate_task` 并行改多个 prompt 文件，比串行快 3x。但每个子 agent 只改一个文件，避免跨文件依赖。
+
+### LLM 身份幻觉防范（必加）
+
+**问题**：LLM 看到用户（黄宗宁，`sender=__self__`）在群里讨论某产品（如 Kimi K2.6），会幻觉用户是该公司创始人（"黄宗宁亲自解读"）。这在 trending-scan 和 digest 中尤其容易发生。
+
+**修复**：在所有涉及人物描述的 prompt 中（trending-scan、digest、tech-scan、trending-daily）加入身份防幻觉块：
+
+```markdown
+**⚠️ 身份与事实准确性：**
+- 消息中 sender=`__self__` 的是**用户本人（黄宗宁）**，是 AI Agent 爱好者/开发者，**不是**任何公司创始人
+- **严禁编造人物身份**，讨论某产品 ≠ 创始人
+- 描述人物只用消息中明确出现的身份，不猜测不推断
+```
+
+**原则**：用户参与讨论 ≠ 用户是负责人。宁可少说，不要编造。
+
+### Todo 描述修正：查源数据而非猜测
+
+**问题**：当用户说"这个 todo 描述不对"时，不要凭印象改，应该查 `collector.db` 原始聊天记录。
+
+**方法**：
+1. 用 `sqlite3 collector.db "SELECT msg_time, sender, content FROM messages WHERE chatroom_id='<私聊ID>' ORDER BY msg_time"` 取上下文
+2. 找到生成该 todo 的原始对话
+3. 根据原始对话准确更新 `scan_state.json` 和 `assistant.db`
+
+**示例**：阿北的 creao 返佣 todo，原始记录是"阿北: 好，你选个handle，你的唯一返佣链接，我后台给你开"，说明是阿北帮用户开，不是用户给阿北发。
+
+### Cron 推送格式：永远全量展示
+
+**原则**：todo-scan 每次都展示**全部 open todo**，不发"无变化"简短心跳。用户需要一眼看到全景。
+- 无变化时标题写"无变化"，但 todo 列表照列
+- 新增用 🔔，已确认用 🟢，超3天标注 `(X天前)`
+- 状态栏保留：`🕐 cron: wechat-todo-scan · ... · 结果：N新增 N完成`
+
 ## Security Notes
 
 - `all_keys.json` 包含数据库加密密钥，**不要泄露或提交到 Git**
 - `config.yaml` 包含路径配置，同样需要保密
 - 密钥提取需要 **sudo** 权限
 
-### 问题6: 手动搜索特定消息内容（ad-hoc 查询）
+### 问题6: assistant.db 表结构与写入陷阱
+
+**症状**: 写入 `assistant.db` 时报错 `OperationalError: table XXX has no column named YYY`。
+
+**原因**: `assistant.db` 的表结构与常见的 JSON 结构不同。例如 `todos` 表使用：
+- `created_ts` (INTEGER timestamp) + `created_date` (TEXT 'YYYY-MM-DD') 而非单纯的 `created` 字段
+- 没有 `urgent` 列（优先级在推送逻辑中判断，不存储在数据库）
+- `updated_ts` 记录最后更新时间
+
+**排查**:
+```bash
+# 查看表结构
+python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_writer.py --db ~/wechat-assistant/assistant.db --query "PRAGMA table_info(todos)"
+
+# 查看已有的 todos 记录
+python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_writer.py --db ~/wechat-assistant/assistant.db --query "SELECT * FROM todos LIMIT 5"
+```
+
+**修复**: 在写入前先检查表结构，使用正确的列名和数据类型：
+
+```python
+# 正确的写入方式
+def date_to_ts(date_str):
+    if not date_str:
+        return None
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    return int(dt.timestamp()) + 8 * 3600  # 北京时区 UTC+8
+
+cur.execute("""
+    INSERT OR REPLACE INTO todos (id, contact, summary, status, created_ts, created_date, updated_ts)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+""", (todo["id"], todo["contact"], todo["summary"], todo["status"],
+      date_to_ts(todo["created_date"]), todo["created_date"], int(datetime.now().timestamp())))
+```
+
+**经验**: 直接用 `db_writer.py` 的 CLI 更可靠：
+```bash
+# 写入 todos（--data 接收内联 JSON 字符串）
+python3 db_writer.py --db ~/wechat-assistant/assistant.db --table todos --data '[{"id":"todo_001","contact":"张三","summary":"...","status":"open","created_ts":1776000000,"created_date":"2026-04-19"}]'
+
+# 从 JSON 文件读取（--file 接收文件路径，不要用 --data 传文件路径！）
+python3 db_writer.py --db ~/wechat-assistant/assistant.db --table trending_topics --file /tmp/trending_result.json
+```
+
+> **`--data` vs `--file`**: `--data` 期望内联 JSON 字符串，`--file` 期望文件路径。用 `--data /tmp/file.json` 会把路径当 JSON 解析导致报错。
+
+### 问题7: 手动搜索特定消息内容（ad-hoc 查询）
 
 当用户问"某某内容在哪个群"时，需要跨多个解密数据库搜索。关键映射链：
 
@@ -808,6 +911,71 @@ conn.close()
 > **要点**：`message_fts.db` 的 `name2id` 表用 `rowid` 映射，FTS 表的 `session_id` 就是 `name2id` 的 `rowid`。
 > `local_type=21474836529`（0x80000011）通常是链接/文章分享类型，普通文本消息 `local_type` 不同。
 > 如果 FTS 搜索无结果，也可以直接搜 `collector.db`（已同步的数据）：`SELECT * FROM messages WHERE content LIKE '%关键词%'`。
+
+### Cron 推送执行细节（实战经验）
+
+**时间戳转换为扫描窗口**：
+
+`extract_todos.py` 输出包含 `ts_start` 和 `ts_end`（Unix timestamp），需要转换为可读的扫描窗口：
+
+```python
+from datetime import datetime, timezone, timedelta
+
+# 示例：ts_start=1776700800, ts_end=1776771372
+start_dt = datetime.fromtimestamp(ts_start, tz=timezone(timedelta(hours=8)))
+end_dt = datetime.fromtimestamp(ts_end, tz=timezone(timedelta(hours=8)))
+scan_window = f"{start_dt.strftime('%H:%M')}~{end_dt.strftime('%H:%M')}"
+
+print(f"扫描窗口: {scan_window}")  # 00:00~19:36
+```
+
+**状态栏格式验证**：
+
+每个 cron 推送末尾必须包含统一状态栏：
+
+```markdown
+---
+🕐 cron: <cron-name> · 运行于 YYYY-MM-DD HH:MM · 扫描窗口 HH:MM~HH:MM · 结果：...
+```
+
+**静默时段检测**：
+
+todo-scan 和 calendar-scan 在 23:00-08:00 期间不推送（state 照常更新）：
+
+```python
+from datetime import datetime, timezone, timedelta
+
+now = datetime.now(tz=timezone(timedelta(hours=8)))
+hour = now.hour
+in_quiet_hours = hour >= 23 or hour < 8
+
+if in_quiet_hours:
+    # 更新 state 但不推送飞书
+    pass
+else:
+    # 正常推送
+    pass
+```
+
+**待办完成判定需谨慎**：
+
+当发现对话中包含 "搞定"、"完成"、"已通过" 等关键词时，需仔细确认：
+
+1. **检查上下文**：该关键词是否真的表示 todo 完成，而非其他含义（如评价产品）
+2. **验证关联**：确认该消息对应的 todo 确实存在（通过 contact 和 summary 匹配）
+3. **避免误判**：如果不确定，保留为 open 状态，让用户手动确认
+
+示例：todo_003（森森淼淼："帮忙询问项目信息"）对话中出现 "搞定"，但这是评价 screen studio 工具，不是 todo 完成。应保留 open 状态。
+
+**报告内容完整性**：
+
+todo-scan 必须显示所有 open todos，即使无变化也要列出：
+
+- **有变化时**：标题写 "今日更新"，分类显示新增/更新/紧急/其他
+- **无变化时**：标题写 "今日无变化"，但 todo 列表照列
+- **新增标记**：`🔔` 表示新待办或待确认更新
+- **已确认标记**：`🟢` 表示已读/已确认
+- **天数标注**：超3天的 todo 标注 `(X天前)`
 
 ### 问题5: trending 热点全是大类词（"Claude 25群, GPT 12群"）——零信息量
 

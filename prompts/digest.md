@@ -1,8 +1,14 @@
-# 干货收集 — Cron Prompt
+# 干货收集 — Cron Prompt（决策脑 v2）
 
 ## 任务
 
 从微信监控群中提炼昨天的干货内容，推送到飞书并归档到 Obsidian。
+
+
+**⚠️ 身份与事实准确性：**
+- 消息中 sender=`__self__` 的是**用户本人（黄宗宁）**，是 AI Agent 爱好者/开发者，**不是**任何公司创始人
+- **严禁编造人物身份**，讨论某产品 ≠ 创始人
+- 描述人物只用消息中明确出现的身份，不猜测不推断
 
 ## 执行步骤
 
@@ -25,7 +31,25 @@ python3 collector.py --config /Users/serva/wechat-assistant/config.yaml --sync
 > 发飞书告警：`⚠️ 微信密钥已过期，需要重新提取。请运行 sudo find_all_keys_macos`
 > 然后**终止本次任务**，不继续后续步骤。
 
-### 2. 提取群聊数据
+### 2. 感知用户状态（Layer A）
+
+在分析内容之前，先感知用户当前状态，以便后续输出能适应用户情境：
+
+```bash
+python3 -c "
+import sys
+sys.path.insert(0, '/Users/serva/.hermes/skills/social-media/wechat-assistant/scripts')
+from state_manager import StateManager
+sm = StateManager('/Users/serva/wechat-assistant/scan_state.json')
+status, context = sm.infer_user_status()
+print(f'USER_STATUS={status}')
+print(f'USER_CONTEXT={context}')
+"
+```
+
+> 将 `USER_STATUS` 和 `USER_CONTEXT` 记录下来，用于状态栏展示和后续步骤的上下文感知。
+
+### 3. 提取群聊数据
 
 ```bash
 python3 extract_digest.py --config /Users/serva/wechat-assistant/config.yaml --date yesterday
@@ -34,7 +58,7 @@ python3 extract_digest.py --config /Users/serva/wechat-assistant/config.yaml --d
 > 输出 JSON 到 stdout，包含每个群的消息列表。
 > **如果 `already_done` 为 true** — 昨天的干货已收集过，直接终止不重复推送。
 
-### 3. 分析 JSON 输出
+### 4. 分析 JSON 输出
 
 从每个群的消息中提炼干货。
 
@@ -54,7 +78,7 @@ python3 extract_digest.py --config /Users/serva/wechat-assistant/config.yaml --d
 - 已被大量转发的陈旧信息
 - 拉票、投票、砍价类
 
-### 4. 推送到飞书
+### 5. 推送到飞书
 
 **只在有干货时**推送。
 
@@ -92,16 +116,16 @@ python3 extract_digest.py --config /Users/serva/wechat-assistant/config.yaml --d
 
 如果所有群都没有干货，发一条简短的"昨天群里没什么干货"。
 
-### 5.5 状态栏
+### 6.5 状态栏
 
 每条推送消息末尾必须加上状态栏，格式：
 
 ```
 ---
-🕐 cron: wechat-digest · 运行于 YYYY-MM-DD HH:MM · 覆盖：昨天全天 · 结果：X群 Y条干货
+🕐 cron: wechat-digest · 运行于 YYYY-MM-DD HH:MM · 覆盖：昨天全天 · 结果：X群 Y条干货 · 状态: {USER_STATUS}
 ```
 
-### 5. 标记已完成
+### 7. 标记已完成
 
 推送成功后，更新 scan_state.json：
 
@@ -118,7 +142,7 @@ with open(state_path, 'w') as f:
 "
 ```
 
-### 6. Obsidian 归档
+### 8. Obsidian 归档
 
 将干货内容写入 Obsidian vault（如果用户配置了 vault 路径）：
 
@@ -136,7 +160,7 @@ groups: [群名1, 群名2]
 ---
 ```
 
-### 7. 保存结构化 JSON
+### 9. 保存结构化 JSON
 
 将分析结果保存到本地，供后续 insight 分析使用：
 
@@ -181,7 +205,7 @@ print(f'Saved: {path}')
 "
 ```
 
-### 6.5 写入 assistant.db
+### 9.5 写入 assistant.db
 
 将昨日摘要写入 SQLite 数据库：
 

@@ -129,6 +129,17 @@ CREATE TABLE IF NOT EXISTS scan_log (
     duration_ms INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS push_feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    push_time   TEXT NOT NULL,            -- 推送时间 ISO格式
+    push_type   TEXT NOT NULL,            -- todo/calendar/trending/digest/tech
+    content_summary TEXT NOT NULL,        -- 推送内容摘要
+    priority    TEXT DEFAULT 'normal',    -- urgent/normal/deferred
+    user_action TEXT DEFAULT NULL,        -- acted/ignored/snoozed（NULL=未判断）
+    action_time TEXT DEFAULT NULL,        -- 用户行动时间
+    inferred_from TEXT DEFAULT NULL       -- 推断来源（todo_resolved/feishu_read/timeout等）
+);
+
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_trending_date ON trending_topics(scan_date);
 CREATE INDEX IF NOT EXISTS idx_trending_keyword ON trending_topics(keyword);
@@ -139,6 +150,8 @@ CREATE INDEX IF NOT EXISTS idx_tech_date ON tech_highlights(scan_date);
 CREATE INDEX IF NOT EXISTS idx_prefs_date ON preferences(date);
 CREATE INDEX IF NOT EXISTS idx_profile_date ON profile_snapshots(date);
 CREATE INDEX IF NOT EXISTS idx_scan_log_type ON scan_log(scan_type, scan_date);
+CREATE INDEX IF NOT EXISTS idx_push_feedback_type ON push_feedback(push_type, push_time);
+CREATE INDEX IF NOT EXISTS idx_push_feedback_action ON push_feedback(user_action);
 """
 
 
@@ -348,6 +361,31 @@ _TABLE_WRITERS = {
     'profile_snapshots': write_profile_snapshots,
     'digests': write_digests,
 }
+
+
+def write_push_feedback(conn, items):
+    """写入推送反馈记录"""
+    now_str = datetime.now(tz=_TZ8).isoformat()
+    for item in items:
+        conn.execute("""
+            INSERT INTO push_feedback
+                (push_time, push_type, content_summary, priority, user_action, action_time, inferred_from)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            item.get('push_time', now_str),
+            item.get('push_type', ''),
+            item.get('content_summary', ''),
+            item.get('priority', 'normal'),
+            item.get('user_action'),
+            item.get('action_time'),
+            item.get('inferred_from'),
+        ))
+    conn.commit()
+    return len(items)
+
+
+# Register push_feedback in table writers
+_TABLE_WRITERS['push_feedback'] = write_push_feedback
 
 
 def main():
