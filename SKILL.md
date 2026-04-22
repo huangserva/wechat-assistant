@@ -71,7 +71,7 @@ scripts/
   extract_todos.py           — 提取私聊对话 + 已有 todos → JSON
   extract_calendar.py        — 提取日程 + 已有 events → JSON
   extract_digest.py          — 提取群聊消息（含 daily_done 去重）→ JSON
-  extract_trending.py        — 提取跨群热点（今日累计模式，每次从 00:00 扫到当前）→ JSON
+  extract_trending.py        — 提取跨群热点（增量窗口模式，默认从上次扫描点继续）→ JSON
   extract_tech.py            — 提取技术讨论（含 daily_done 去重）→ JSON
   insight.py                 — 读取多天 digest JSON，输出合并数据供 LLM 分析
   extract_preferences.py     — 提取用户偏好/观点消息（关键词模式匹配）+ 写作样本 → JSON
@@ -80,7 +80,7 @@ prompts/
   todo-scan.md               — 待办扫描 cron prompt（决策脑 v2：Layer A 状态感知 + acknowledged + 优先级排序）
   calendar-scan.md           — 日程扫描 cron prompt（决策脑 v2：Layer A + 优先级排序）
   digest.md                  — 干货收集 cron prompt（决策脑 v2：含 daily_done 检查 + JSON 存档）
-  trending-scan.md           — 热点扫描 cron prompt（决策脑 v2：今日累计模式，每小时）
+  trending-scan.md           — 热点扫描 cron prompt（决策脑 v2：增量窗口模式，按新变化推送）
   trending-daily.md          — 热点日汇总 cron prompt（每天 21:00）
   tech-scan.md               — 技术讨论 cron prompt（决策脑 v2：含 daily_done 检查）
   insight.md                 — 洞察分析 cron prompt（每3天，话题关联+群画像）
@@ -139,7 +139,7 @@ profile/
 - **todos**: `existing_todos` 字段传给 prompt，LLM 对比已有 open items 去重。状态机：`open` → (用户说完成) → `done` → (7天后) → 自动归档
 - **calendar**: `existing_events` 字段传给 prompt，已有 pending/confirmed 不重复推送。状态机：`pending` → (用户确认) → `confirmed` → (日期已过) → `expired`
 - **digest**: 按 `daily_done` 日期去重，同一天的只跑一次
-- **trending**: `last_scan_ts` 记录上次扫描时间。**今日累计模式**：每次从今天 00:00 扫到当前，越到晚上数据越多，跨群关联越容易发现。去重靠 `existing_topics`（已报过的话题不重复推）。`daily_done` 防止重复日汇总
+- **trending**: `last_scan_ts` 记录上次扫描时间。**增量窗口模式**：默认从上次扫描点回补约 20 分钟到当前，首次运行回看最近 6 小时。去重靠 `existing_topics`（只推新增或明显升温的话题）。`daily_done` 仅供 trending-daily 防重复日汇总
 - **tech**: 按 `daily_done` 日期去重，同一天的只跑一次
 - **insight**: `last_run_date` 防止同一天重复运行，`last_analyzed_dates` 记录已分析的 digest 日期，`run_count` 累计运行次数
 - **preference**: `last_run_date` 防止同一天重复运行，`run_count` 累计运行次数。画像存储在 `profile/servasyy_profile.json`
@@ -321,7 +321,7 @@ Hermes 通过飞书 WebSocket 网关推送 cron 结果。确保：
 #### Cron 1: 待办扫描（每 30 分钟）
 - 模板：`prompts/todo-scan.md`
 - Schedule: `*/30 * * * *`
-- 状态：对比 `scan_state.json` 中的已有 open todos，只推送新增/变化
+- 状态：对比 `scan_state.json` 中的已有 open todos，只推送新增/完成/关键存量摘要，不再每次刷全量 open todos
 
 #### Cron 2: 日程扫描（每 30 分钟）
 - 模板：`prompts/calendar-scan.md`
@@ -336,7 +336,7 @@ Hermes 通过飞书 WebSocket 网关推送 cron 结果。确保：
 #### Cron 4: 热点扫描（每小时）
 - 模板：`prompts/trending-scan.md`
 - Schedule: `0 * * * *`
-- 状态：**今日累计模式**，每次从今天 00:00 扫到当前时间（不是增量）。越到晚上数据越多，跨群关联越明显。去重靠 `existing_topics`
+- 状态：**增量窗口模式**，默认从上次扫描点回补约 20 分钟到当前时间。只推新增或明显升温的话题，日汇总交给 `trending-daily`
 
 #### Cron 5: 热点日汇总（每天 21:00）
 - 模板：`prompts/trending-daily.md`
@@ -410,7 +410,7 @@ python3 extract_digest.py --config config.yaml --groups "123@chatroom,456@chatro
 ### 提取跨群热点
 
 ```bash
-# 今日累计模式（默认）：从今天 00:00 到当前时间，每次看全天数据
+# 增量窗口模式（默认）：从上次扫描点回补约 20 分钟到当前
 python3 extract_trending.py --config config.yaml
 
 # 全量（指定日期）
@@ -420,7 +420,7 @@ python3 extract_trending.py --config config.yaml --full --date 2026-03-12
 python3 extract_trending.py --config config.yaml --top 30 --min-groups 3 --min-count 5
 ```
 
-今日累计模式每次从今天 00:00 扫到当前时间，越到晚上数据越多，跨群关联越容易发现。去重靠 `existing_topics`（已报过的话题不重复推）。全量模式（`--full`）扫描指定日期的整天。
+增量窗口模式默认从上次扫描点回补约 20 分钟到当前时间，首次运行回看最近 6 小时。去重靠 `existing_topics`（只推新增或明显升温的话题）。全量模式（`--full`）扫描指定日期的整天。
 
 **话题提取机制**（2026-04-20 重构）：
 
@@ -796,11 +796,11 @@ python3 $SKILL/extract_tech.py --config $CFG --date yesterday | python3 -c "impo
 
 **示例**：阿北的 creao 返佣 todo，原始记录是"阿北: 好，你选个handle，你的唯一返佣链接，我后台给你开"，说明是阿北帮用户开，不是用户给阿北发。
 
-### Cron 推送格式：永远全量展示
+### Cron 推送格式：增量优先，摘要输出
 
-**原则**：todo-scan 每次都展示**全部 open todo**，不发"无变化"简短心跳。用户需要一眼看到全景。
-- 无变化时标题写"无变化"，但 todo 列表照列
-- 新增用 🔔，已确认用 🟢，超3天标注 `(X天前)`
+**原则**：todo-scan 默认只展示**本轮新增 / 本轮完成 / 关键存量提醒**，不再每次刷完整 open todo 列表。
+- 无新增、无完成、无关键存量时，只发简短状态心跳
+- 关键存量提醒只包含：urgent、超24h未确认、超3天未完成
 - 状态栏保留：`🕐 cron: wechat-todo-scan · ... · 结果：N新增 N完成`
 
 ## Security Notes
@@ -969,13 +969,13 @@ else:
 
 **报告内容完整性**：
 
-todo-scan 必须显示所有 open todos，即使无变化也要列出：
+todo-scan 默认采用“增量 + 摘要”输出，不再无差别展开所有 open todos：
 
-- **有变化时**：标题写 "今日更新"，分类显示新增/更新/紧急/其他
-- **无变化时**：标题写 "今日无变化"，但 todo 列表照列
+- **有变化时**：重点展示新增/完成/关键存量提醒
+- **无变化时**：发简短状态消息，不重复整表
 - **新增标记**：`🔔` 表示新待办或待确认更新
 - **已确认标记**：`🟢` 表示已读/已确认
-- **天数标注**：超3天的 todo 标注 `(X天前)`
+- **天数标注**：关键存量里超3天的 todo 仍标注 `(X天前)`
 
 ### 问题5: trending 热点全是大类词（"Claude 25群, GPT 12群"）——零信息量
 

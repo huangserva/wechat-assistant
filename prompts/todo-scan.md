@@ -1,8 +1,8 @@
-# 待办扫描 — Cron Prompt（决策脑 v2）
+# 待办扫描 — Cron Prompt（增量优先，摘要输出）
 
 ## 任务
 
-从微信私聊中提取待办事项，结合用户状态推断优先级，推送到飞书。
+从微信私聊中提取**增量窗口内**的新待办和已解决事项，结合已有 open todos 做去重与状态更新；推送以“新增 + 完成 + 关键存量摘要”为主，不要每次都刷整张全量待办表。
 
 ## 执行步骤
 
@@ -50,7 +50,7 @@ if acked > 0:
 
 ### 2.5 检查手动状态设置
 
-检查 user_state.json 中是否有未过期的手动状态设置：
+检查 `user_state.json` 中是否有未过期的手动状态设置：
 
 ```bash
 python3 -c "
@@ -83,7 +83,7 @@ else:
 ```
 
 如果输出 `MANUAL_STATUS=xxx` 且不是 expired/none：
-- 用手动设置的状态覆盖 infer_user_status() 的结果
+- 用手动设置的状态覆盖 `infer_user_status()` 的结果
 - 推送状态栏中显示 `状态: {MANUAL_STATUS} (手动设置，剩余 Xh)`
 
 ### 3. 提取私聊数据
@@ -92,7 +92,8 @@ else:
 python3 extract_todos.py --config /Users/serva/wechat-assistant/config.yaml
 ```
 
-> 输出 JSON 到 stdout，包含 `conversations`、`existing_todos`（来自 scan_state.json）和 `scan_state_path`。
+> 默认是**增量窗口模式**：从上次 `todos.last_scan_ts` 往前回补约 15 分钟到当前时间；首次运行回看最近 12 小时。
+> 输出 JSON 到 stdout，包含 `conversations`、`existing_todos`（来自 `scan_state.json`）、`scan_state_path`、`scan_window`。
 
 ### 4. 轻量偏好归档
 
@@ -127,18 +128,18 @@ else:
 "
 ```
 
-> 这步不需要推送，只是默默归档。preference-scan cron 会读这些归档文件做深度分析。
+> 这步不需要推送，只是默默归档。`preference-scan` cron 会读这些归档文件做深度分析。
 
 ### 5. 分析 JSON 输出
 
-从 conversations 中识别待办事项。
+从 `conversations` 中识别待办事项。
 
 #### 什么算待办
 - 对方**请求我做的事**（明确的 action item）
-- **我承诺要做的事**（"好的我去处理"、"我来搞"）
-- 涉及**金钱、合同、法律**的事项（urgent=true）
-- 有**明确 deadline** 的事项（urgent=true）
-- **重大事项**：即使没有明确 action，但涉及金钱交易、付款、收款、投资决定、重要约定、人事变动等，也应标记为待关注（urgent=true）
+- **我承诺要做的事**（“好的我去处理”、“我来搞”）
+- 涉及**金钱、合同、法律**的事项（`urgent=true`）
+- 有**明确 deadline** 的事项（`urgent=true`）
+- **重大事项**：即使没有明确 action，但涉及金钱交易、付款、收款、投资决定、重要约定、人事变动等，也应标记为待关注（`urgent=true`）
 - **重要承诺**：双方达成一致的约定（不限于我单方面承诺）
 
 #### 什么不算待办
@@ -147,18 +148,18 @@ else:
 - 咨询性质的对话（我在回答别人问题）
 - 广告、推销、群发消息
 - 纯表情、图片消息
-- 已在 existing_todos 中且 status=done 的（不重复）
+- 已在 `existing_todos` 中且 `status=done` 的（不重复）
 
 #### 去重规则
 - 检查 `existing_todos` 中是否已存在相似待办（同一联系人 + 相似 summary）
 - 已存在的不重复添加
 - 检查是否有待办在对话中被解决（resolved）
-- 对话中有"搞定了"、"已完成"、"不用了" → 标记对应 todo 为 done
+- 对话中有“搞定了”、“已完成”、“不用了” → 标记对应 todo 为 `done`
 
 ### 6. 优先级排序（Layer B）
 
 分析完成后，对每个待办进行优先级评估。考虑因素：
-- **urgent 字段**：已标记 urgent 的 → 🔴 高优
+- **urgent 字段**：已标记 `urgent` 的 → 🔴 高优
 - **时效性**：有明确 deadline 的 → 🔴；deadline 临近（<24h）→ 🔴🔴
 - **用户当前状态**：如果 `USER_STATUS=sleeping`，所有推送降级；如果 `USER_STATUS=busy`，只推 🔴
 - **存续时间**：已 open 超过 3 天且未 acknowledged → 🟡（提醒）
@@ -173,6 +174,27 @@ else:
 | 🟡 | 需跟进 | 非 urgent 但需要行动 |
 | 🟢 | 已确认 | acknowledged=true，等待结果 |
 | ⚪ | 可延后 | 非 urgent + 无 deadline + >3天 |
+
+### 6.5 推送裁剪规则（关键）
+
+**不要再每次输出全部 open todos。** 正文只展开以下三类：
+1. **本轮新增**
+2. **本轮完成**
+3. **关键存量提醒**（最多 3 条）
+
+`关键存量提醒` 只包括：
+- `urgent=true` 的 open todo
+- `acknowledged=false` 且创建超过 24 小时的 open todo
+- `acknowledged=true` 但创建超过 3 天仍未完成的 open todo
+
+其余普通 open todo **只计入汇总数字，不逐条展开**。
+
+如果满足以下条件：
+- `0 新增`
+- `0 完成`
+- `0 关键存量提醒`
+
+则只发**简短状态消息**，不要输出长正文。
 
 ### 7. 更新 scan_state.json
 
@@ -202,7 +224,7 @@ with open(state_path, 'w') as f:
 
 ### 8. 更新用户状态（Layer A 写回）
 
-每次扫描后更新 user_state.json：
+每次扫描后更新 `user_state.json`：
 
 ```bash
 python3 -c "
@@ -233,46 +255,47 @@ print('[OK] user_state updated')
 
 ### 10. 推送到飞书
 
-**每次都展示全部 open 待办**（包括旧的），让用户一眼看到全景。
-新 todo 用 🔔 标记，已确认的用 🟢 标记。
+**最终推送必须使用简体中文。** 除专有名词、产品名、URL、代码标识外，不要出现英文标题、英文句子或英文小结。
 
-**每次推送都必须列出全部 open 待办**，无论有无变化。
+**默认采用“增量 + 摘要”格式**，不要重复发送全部 open todo。
 
 格式：
 ```
 📋 **YYYY-MM-DD HH:MM 微信待办更新**
 
-🔴 **紧急**
-1. 🔔 **联系人** — 待办描述
-2. 🟢 **联系人** — 待办描述（已确认）
-
-🟡 **需跟进**
-1. 🔔 **联系人** — 待办描述
-2. 🟢 **联系人** — 待办描述（3天前创建）
-
-🟢 **已确认·等待中**
+🔔 **本轮新增**
 1. **联系人** — 待办描述
+2. **联系人** — 待办描述
 
-✅ **本次完成**
+✅ **本轮完成**
 - ~~联系人 — 待办描述~~
 
-📊 N 新增 · N 完成 · N 待处理 · 🔔 N 未确认
+⚠️ **仍需盯住**
+- **联系人** — 待办描述（紧急 / 1天未确认 / 4天未完成）
+- **联系人** — 待办描述
+
+📊 当前待办：N open · 🔴 M 紧急 · 🔔 K 未确认
+```
+
+如果没有新增、没有完成、也没有关键存量提醒，则只发一条简短状态消息：
+```
+📋 wechat-todo-scan · YYYY-MM-DD HH:MM · 增量窗口 HH:MM~HH:MM · 无新增/无完成 · 当前待办 N 条 · 紧急 M 条 · 未确认 K 条
 ```
 
 **展示规则（重要！）：**
-- **每次都列出所有 status=open 的待办**，即使 0 新增 0 完成 — 用户需要一眼看到全景
-- 🔔 = acknowledged=false（新 todo，尚未被用户看到）
-- 🟢 = acknowledged=true（已读，但还没完成）
-- 超过 3 天的已确认待办，在描述后标注 `(X天前)`
-- 如果用户回复"这个不用了"，标记为 done
-- 无变化时标题改为"无变化"，但 todo 列表照列
+- 只展开**本轮新增 / 本轮完成 / 关键存量提醒**
+- `🔔` = `acknowledged=false`（新 todo，尚未被用户看到）
+- `🟢` = `acknowledged=true`（已读，但还没完成）
+- `关键存量提醒` 最多列 3 条，按优先级排序
+- 如果用户回复“这个不用了”，标记为 `done`
+- **除非用户明确要求，不要每次都输出全部 open todos**
 
 > **手动状态设置指令**
-> 用户可以通过飞书回复以下指令来设置状态（Hermes 解析后执行 set_user_status）：
-> - "我在开会" / "busy" → busy
-> - "我在忙" / "勿扰" → unavailable
-> - "我在休息" → idle
-> - "恢复" / "正常" → 恢复为自动推断
+> 用户可以通过飞书回复以下指令来设置状态（Hermes 解析后执行 `set_user_status`）：
+> - “我在开会” / “busy” → `busy`
+> - “我在忙” / “勿扰” → `unavailable`
+> - “我在休息” → `idle`
+> - “恢复” / “正常” → 恢复为自动推断
 
 ### 11. 写入 assistant.db
 
@@ -298,4 +321,4 @@ python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_wri
 🕐 cron: wechat-todo-scan · 运行于 YYYY-MM-DD HH:MM · 扫描窗口 HH:MM~HH:MM · 状态: {USER_STATUS} · 结果：N新增 N完成
 ```
 
-**注意：不发送"无变化"的简短心跳**。每次都发完整的待办列表+状态栏，让用户一眼看到全景。
+**注意**：默认发“增量 + 摘要”；只有用户明确要求看全量清单时，才把全部 open todos 展开。

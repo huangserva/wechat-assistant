@@ -3,7 +3,7 @@
 extract_todos.py — 从 collector.db 提取私聊对话，输出 JSON（不调 AI）
 
 用法：
-  python3 extract_todos.py --config config.yaml           # 增量：最近 90 分钟
+  python3 extract_todos.py --config config.yaml            # 增量：默认从上次扫描点继续（带少量回补）
   python3 extract_todos.py --config config.yaml --full     # 全量：昨天整天
 
 输出 JSON 到 stdout:
@@ -11,6 +11,7 @@ extract_todos.py — 从 collector.db 提取私聊对话，输出 JSON（不调 
   "mode": "full|incremental",
   "ts_start": 1234567890,
   "ts_end": 1234567890,
+  "scan_window": {"start_time": "2026-04-22 09:00:00", "end_time": "2026-04-22 12:00:00"},
   "conversations": [
     {"contact": "联系人名", "chatroom_id": "xxx", "messages": [
       {"who": "我|对方名", "content": "...", "time": "HH:MM"}
@@ -29,6 +30,8 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 _TZ8 = timezone(timedelta(hours=8))
+_TODO_BOOTSTRAP_LOOKBACK_HOURS = 12
+_TODO_WINDOW_OVERLAP_SECONDS = 15 * 60
 
 # 共享模块路径
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -136,11 +139,16 @@ def main():
         ts_end = int(today_0.timestamp())
         mode = 'full'
     else:
-        # 今日累计模式：每次从今天 00:00 到 now，看全天私聊
-        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        ts_start = int(today_midnight.timestamp())
+        # 默认增量：从上次扫描点继续，回补少量时间避免漏消息
+        last_scan_ts = sm.get_todo_last_scan_ts()
+        if last_scan_ts > 0:
+            ts_start = max(0, last_scan_ts - _TODO_WINDOW_OVERLAP_SECONDS)
+        else:
+            ts_start = int((now - timedelta(hours=_TODO_BOOTSTRAP_LOOKBACK_HOURS)).timestamp())
         ts_end = now_ts
-        mode = 'today_cumulative'
+        if ts_start >= ts_end:
+            ts_start = max(0, ts_end - _TODO_WINDOW_OVERLAP_SECONDS)
+        mode = 'incremental'
 
     conversations = get_dms(collector_db, ts_start, ts_end)
 
@@ -167,6 +175,12 @@ def main():
         'mode': mode,
         'ts_start': ts_start,
         'ts_end': ts_end,
+        'scan_window': {
+            'start_ts': ts_start,
+            'end_ts': ts_end,
+            'start_time': datetime.fromtimestamp(ts_start, tz=_TZ8).strftime('%Y-%m-%d %H:%M:%S'),
+            'end_time': datetime.fromtimestamp(ts_end, tz=_TZ8).strftime('%Y-%m-%d %H:%M:%S'),
+        },
         'scan_time': now.strftime('%Y-%m-%d %H:%M'),
         'conversations_count': len(conversations),
         'conversations': conversations,

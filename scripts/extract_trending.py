@@ -9,7 +9,7 @@ extract_trending.py — 从 collector.db 提取热点事件，输出 JSON（不�
 4. 消息量突增的群（活跃度异常）
 
 支持两种模式：
-  今日累计模式（默认）：从今天 00:00 到当前时间，每次扫描全天数据
+  增量窗口模式（默认）：从上次扫描点回补少量时间到当前，只看新变化
   全量模式（--full）：扫指定日期的整天（原始行为）
 
 用法：
@@ -22,7 +22,7 @@ extract_trending.py — 从 collector.db 提取热点事件，输出 JSON（不�
 输出 JSON 到 stdout:
 {
   "date": "2026-03-12",
-  "mode": "today_cumulative" | "full",
+  "mode": "incremental" | "full",
   "scan_window": {"start_ts": ..., "end_ts": ...},
   "cross_group_topics": [...],
   "trending_urls": [...],
@@ -44,6 +44,8 @@ from collections import Counter, defaultdict
 from urllib.parse import urlparse, parse_qs
 
 _TZ8 = timezone(timedelta(hours=8))
+_TRENDING_BOOTSTRAP_LOOKBACK_HOURS = 6
+_TRENDING_WINDOW_OVERLAP_SECONDS = 20 * 60
 
 _STOP_WORDS = set(
     '的 了 是 在 我 你 他 她 它 们 这 那 有 没 不 也 就 都 而 与 或 但'
@@ -397,17 +399,16 @@ def main():
         date_label = d.strftime('%Y-%m-%d')
         mode = 'full'
     else:
-        # 今日累计模式：每次从今天 00:00 到 now，看全天的数据
-        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        ts_start = int(today_midnight.timestamp())
+        # 默认增量：从上次扫描点继续，回补少量时间避免漏消息
+        if last_scan_ts > 0:
+            ts_start = max(0, last_scan_ts - _TRENDING_WINDOW_OVERLAP_SECONDS)
+        else:
+            ts_start = int((now - timedelta(hours=_TRENDING_BOOTSTRAP_LOOKBACK_HOURS)).timestamp())
         ts_end = int(now.timestamp())
+        if ts_start >= ts_end:
+            ts_start = max(0, ts_end - _TRENDING_WINDOW_OVERLAP_SECONDS)
         date_label = today_str
-        mode = 'today_cumulative'
-
-    # ─── 增量模式下如果 today 已经汇总过，输出警告但不跳过 ───
-    if already_done_today and not args.full:
-        print(f"[WARN] trending daily_done already set for {today_str}, "
-              f"proceeding with incremental scan anyway", file=sys.stderr)
+        mode = 'incremental'
 
     # ─── 查询数据库 ───
     conn = sqlite3.connect(collector_db)
@@ -567,7 +568,6 @@ def main():
 
     # ─── 更新 state ───
     sm.update_trending(cross_topics, ts_end)
-    sm.mark_trending_daily_done(today_str)
     sm.cleanup_old_trending(days=3)
 
     # ─── 更新学习层映射（如果 LLM 提供了新的 alias） ───
