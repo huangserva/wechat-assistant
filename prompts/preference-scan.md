@@ -1,306 +1,75 @@
-# 用户偏好画像分析 — Cron Prompt（每天 1 次，决策脑 v2）
+# 用户偏好画像分析 — Cron Prompt（固定流程版）
 
-## 任务
+## 目标
 
-读取最近 7 天 `preferences/*.json` 的累计归档，真正带上累计下来的 `preferences + writing_samples`，结合 AI 深度分析，更新用户画像，推送到飞书。
+读取最近 7 天 `preferences/*.json` 的累计归档，结合现有 `profile/servasyy_profile.json`，做一次轻量增量画像更新，并输出中文飞书报告。
 
-## 执行步骤
+## 硬性规则
 
-### 1. 感知用户状态（Layer A）
+- **禁止**运行 `extract_preferences.py --days 7`；该命令会重扫 `collector.db`，成本高且不稳定。
+- **禁止**使用 `delegate_task` / 子 Agent。
+- **禁止**临时生成分析脚本；只能使用本 prompt 指定的两个固定脚本。
+- **禁止**调用 `send_message`；cron 的最终回复会自动投递。
+- 如果没有新数据或今天已完成，最终只回复 `[SILENT]`。
 
-```bash
-python3 -c "
-import sys
-sys.path.insert(0, '/Users/serva/.hermes/skills/social-media/wechat-assistant/scripts')
-from state_manager import StateManager
-sm = StateManager('/Users/serva/wechat-assistant/scan_state.json')
-status, context = sm.infer_user_status()
-print(f'USER_STATUS={status}')
-print(f'USER_CONTEXT={context}')
-"
-```
+## 固定步骤
 
-### 2. 读取归档数据
+### 1. 准备输入
+
+只运行这一条：
 
 ```bash
-python3 -c "
-import json, os, datetime
-
-pref_dir = '/Users/serva/wechat-assistant/preferences'
-today = datetime.date.today()
-files = []
-for i in range(7):
-    d = (today - datetime.timedelta(days=i)).isoformat()
-    p = os.path.join(pref_dir, f'{d}.json')
-    if os.path.exists(p):
-        files.append(p)
-
-def dedupe_preferences(items):
-    seen = set()
-    out = []
-    for item in sorted(items, key=lambda x: x.get('msg_time', 0)):
-        key = (item.get('chatroom_id', ''), item.get('msg_time', 0), item.get('content', ''))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
-
-def dedupe_writing_samples(samples):
-    seen = set()
-    out = []
-    for item in sorted(samples, key=lambda x: x.get('msg_time', 0)):
-        key = (item.get('msg_time', 0), item.get('content', ''))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
-
-def sample_evenly(items, limit=120):
-    if len(items) <= limit:
-        return items
-    if limit <= 1:
-        return [items[-1]]
-    step = (len(items) - 1) / float(limit - 1)
-    picked = []
-    used = set()
-    for i in range(limit):
-        idx = round(i * step)
-        if idx in used:
-            continue
-        used.add(idx)
-        picked.append(items[idx])
-    return picked
-
-if not files:
-    print(json.dumps({
-        'stats': {
-            'preference_count': 0,
-            'writing_samples_count': 0,
-            'writing_samples_total': 0,
-        },
-        'preferences': [],
-        'writing_samples': [],
-        'files': []
-    }, ensure_ascii=False))
-else:
-    all_prefs = []
-    all_samples = []
-    for f in sorted(files):
-        with open(f, encoding='utf-8') as fh:
-            data = json.load(fh)
-        all_prefs.extend(data.get('preferences', []))
-        sample_meta = data.get('writing_samples_meta', [])
-        if sample_meta:
-            all_samples.extend(sample_meta)
-        else:
-            for content in data.get('writing_samples', []):
-                all_samples.append({'content': content, 'msg_time': 0, 'time': ''})
-
-    all_prefs = dedupe_preferences(all_prefs)
-    all_samples = dedupe_writing_samples(all_samples)
-    sampled_samples = sample_evenly(all_samples, limit=120)
-
-    print(json.dumps({
-        'stats': {
-            'preference_count': len(all_prefs),
-            'writing_samples_count': len(sampled_samples),
-            'writing_samples_total': len(all_samples),
-        },
-        'preferences': all_prefs,
-        'writing_samples': [item.get('content', '') for item in sampled_samples],
-        'writing_samples_meta': sampled_samples,
-        'files': files
-    }, ensure_ascii=False))
-"
+python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/prepare_preference_scan.py --config /Users/serva/wechat-assistant/config.yaml
 ```
 
-> 输出 JSON：最近 7 天的累计归档偏好数据，**真正包含 `writing_samples`**。
-> 为控制 token，`writing_samples` 会先去重，再最多均匀抽样 120 条；`writing_samples_total` 表示累计总量。
-> **如果 `preference_count == 0` 且 `writing_samples_count == 0`**：直接终止，不发消息。
+读取输出 JSON：
+- 如果 `should_run == false`：最终回复 `[SILENT]`，不要做后续动作。
+- 如果 `should_run == true`：继续下一步。
 
-### 3. 检查是否需要运行
+### 2. 增量分析
+
+基于 prepare 输出中的：
+- `preferences`
+- `writing_samples`
+- `existing_profile`
+- `feedback_stats`
+- `user_status`
+
+更新画像。要求：
+- 保留仍然有效的旧结论；不要重写成全新画像。
+- 每次最多新增 5 条真正有新信息的 conclusions。
+- 每条新增/更新结论必须包含：`finding`、`confidence`、`source_count`、`evidence`、`first_seen`、`last_seen`。
+- 维度固定优先使用：`tech_preferences`、`business_insights`、`decision_patterns`、`communication_style`、`writing_style`。
+- 输出必须是完整 JSON 对象，不要 Markdown。
+- 输出内容必须是中文。
+
+### 3. 写临时画像 JSON
+
+将完整画像 JSON 写到：
+
+```text
+/tmp/wechat_preference_profile.json
+```
+
+### 4. 校验并落地
+
+只运行这一条：
 
 ```bash
-python3 -c "
-import json
-with open('/Users/serva/wechat-assistant/scan_state.json') as f:
-    state = json.load(f)
-print(state.get('preference', {}).get('last_run_date', ''))
-"
+python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/finalize_preference_scan.py --config /Users/serva/wechat-assistant/config.yaml --profile-input /tmp/wechat_preference_profile.json --scan-log-message "preference:ok"
 ```
 
-如果 last_run_date 是今天 → 已运行过，终止。
+如果 finalize 返回 `ok: false` 或命令失败：最终报告失败原因，不要伪装成功。
 
-### 4. 读取现有画像
+### 5. 中文报告
 
-```bash
-python3 -c "
-import json, os
-path = '/Users/serva/wechat-assistant/profile/servasyy_profile.json'
-if os.path.exists(path):
-    with open(path) as f:
-        print(json.dumps(json.load(f), ensure_ascii=False))
-else:
-    print('{}')
-"
-```
+报告格式：
 
-### 5. AI 深度分析
-
-基于提取的 `preferences` 和累计归档后的 `writing_samples`，结合现有画像，进行以下分析：
-
-#### 5.1 技术偏好分析
-- 编程语言/框架偏好（倾向什么、回避什么）
-- 工具链选择倾向（IDE、CLI、云服务）
-- AI/LLM 使用偏好（模型选择、prompt 风格、Agent 工作流）
-- 架构偏好（微服务 vs 单体、云 vs 本地）
-
-#### 5.2 商业见解分析
-- 对市场的判断和预测
-- 商业模式偏好
-- 竞争策略观点
-- 成本/效率考量
-
-#### 5.3 决策模式分析
-- 决策风格（果断/谨慎/数据驱动/直觉）
-- 优先级排序模式
-- 风险偏好
-
-#### 5.4 人际沟通风格
-- 表达方式（直接/委婉/幽默）
-- 常用句式和口头禅
-- 情绪模式（在什么情境下表达什么情绪）
-
-#### 5.5 写作风格
-- 从累计归档并抽样后的 `writing_samples` 分析：
-  - 平均句长
-  - 用词偏好（口语化程度、专业术语密度）
-  - 标点使用习惯
-  - emoji 使用频率
-  - 表达结构（总分/列举/叙述）
-
-### 5.5 反馈数据分析（Layer C）
-
-读取最近 7 天的 push_feedback 数据，分析推送效果：
-
-```bash
-python3 -c "
-import sqlite3, json
-from datetime import datetime, timedelta
-
-db = sqlite3.connect('/Users/serva/wechat-assistant/assistant.db')
-cutoff = (datetime.now() - timedelta(days=7)).isoformat()
-rows = db.execute('''
-    SELECT push_type, priority, user_action, push_time
-    FROM push_feedback
-    WHERE push_time > ?
-    ORDER BY push_time DESC
-''', (cutoff,)).fetchall()
-db.close()
-
-# 统计
-stats = {'total': len(rows), 'by_type': {}, 'by_action': {'acted': 0, 'ignored': 0, 'snoozed': 0, 'pending': 0}}
-for r in rows:
-    push_type, priority, action, push_time = r
-    if push_type not in stats['by_type']:
-        stats['by_type'][push_type] = {'total': 0, 'acted': 0, 'ignored': 0}
-    stats['by_type'][push_type]['total'] += 1
-    if action == 'acted':
-        stats['by_type'][push_type]['acted'] += 1
-        stats['by_action']['acted'] += 1
-    elif action == 'ignored':
-        stats['by_type'][push_type]['ignored'] += 1
-        stats['by_action']['ignored'] += 1
-    elif action == 'snoozed':
-        stats['by_action']['snoozed'] += 1
-    else:
-        stats['by_action']['pending'] += 1
-print(json.dumps(stats, ensure_ascii=False))
-"
-```
-
-> **如果 `stats.total` 为 0**（表刚建无数据）：跳过后续分析，在推送中标注"反馈数据尚在积累中"。
-
-分析维度：
-1. **哪类推送被忽略最多** → 计算各类 ignore_rate，超过 50% 的类型标记为 `low_effectiveness`
-2. **哪些时间段推送效果最好** → 找 acted 最多的时间窗口
-3. **优先级是否合理** → 🔴紧急的 acted 率应该高，如果不高说明误判多
-4. **整体推送频率是否合适** → 如果 ignore 率持续上升，说明推送过频
-
-将分析结果写入 user_state.json 的 feedback_stats 和 patterns 字段。
-
-### 6. 更新画像
-
-分析完成后，将结果合并到画像文件。**合并规则**：
-- 已有的画像维度：增量更新（追加新发现，不删除旧结论）
-- 新发现的维度：新增
-- 矛盾的信息：保留最新的，标注时间戳
-- 每个结论附带 confidence（high/medium/low）和 source_count（来自多少条消息）
-
-```bash
-python3 -c "
-import json, datetime, os
-
-profile_path = '/Users/serva/wechat-assistant/profile/servasyy_profile.json'
-os.makedirs(os.path.dirname(profile_path), exist_ok=True)
-
-# 读取现有画像（如果存在）
-existing = {}
-if os.path.exists(profile_path):
-    with open(profile_path) as f:
-        existing = json.load(f)
-
-# 合并新分析结果（具体逻辑由 AI 决定）
-# updated = { ... AI 分析结果 ... }
-# with open(profile_path, 'w') as f:
-#     json.dump(updated, f, ensure_ascii=False, indent=2)
-
-# 更新 scan_state.json
-state_path = '/Users/serva/wechat-assistant/scan_state.json'
-with open(state_path) as f:
-    state = json.load(f)
-if 'preference' not in state:
-    state['preference'] = {}
-state['preference']['last_run_date'] = datetime.date.today().isoformat()
-state['preference']['run_count'] = state['preference'].get('run_count', 0) + 1
-with open(state_path, 'w') as f:
-    json.dump(state, f, ensure_ascii=False, indent=2)
-
-# 更新 user_state.json 的反馈统计（由 5.5 步骤的分析结果填入）
-import sys
-sys.path.insert(0, '/Users/serva/.hermes/skills/social-media/wechat-assistant/scripts')
-from state_manager import StateManager
-sm2 = StateManager('/Users/serva/wechat-assistant/scan_state.json')
-sm2.update_user_state({
-    'feedback_stats': {
-        # 由 AI 分析结果填入
-        'total_pushed': 0,
-        'total_acted': 0,
-        'total_ignored': 0,
-        'total_snoozed': 0,
-        'by_type': {},
-        'last_updated': datetime.date.today().isoformat()
-    },
-    'patterns': {
-        'push_effectiveness_notes': 'AI 分析结论写这里'
-    }
-})
-"
-```
-
-### 7. 推送到飞书
-
-格式：
-```
-🧑 **用户画像更新（MM.DD）**
-
----
+```text
+🧑 用户画像更新（MM.DD）
 
 ### 🔧 技术偏好
-- **新增**：偏好描述（confidence: high, 来源: N 条消息）
-- **更新**：原有偏好描述 → 新的偏好描述
+- 新增/更新结论（confidence: high/medium/low，来源: N 条）
 
 ### 💼 商业见解
 - ...
@@ -315,32 +84,15 @@ sm2.update_user_state({
 - ...
 
 ---
-
-📊 本期分析：偏好消息 N 条 · 写作样本 M 条（累计 T 条） · 覆盖 7 天
+📊 本期分析：偏好消息 N 条 · 写作样本 M 条（累计 T 条） · 画像维度 D · 状态: USER_STATUS
 ```
 
-如果画像没有实质性变化（只是确认已有结论），简化报告为：
-```
-🧑 **用户画像确认（MM.DD）**
-无新增偏好发现。现有画像 N 个维度，M 个结论保持不变。
+如果没有实质新增，只输出简短确认：
 
-📊 本期分析：偏好消息 N 条 · 写作样本 M 条（累计 T 条）
-```
+```text
+🧑 用户画像确认（MM.DD）
+无新增偏好发现。现有画像保持稳定。
 
-### 8. 写入 assistant.db
-
-将用户画像更新写入 SQLite 数据库：
-
-```bash
-python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_writer.py --db ~/wechat-assistant/assistant.db --table profile_snapshots --data '[{每个维度: dimension, conclusions(JSON array)}]'
-python3 /Users/serva/.hermes/skills/social-media/wechat-assistant/scripts/db_writer.py --db ~/wechat-assistant/assistant.db --scan-log "preference:ok:N维度·M结论"
-```
-
-### 9. 状态栏
-
-每条推送末尾加上状态栏：
-
-```
 ---
-🕐 cron: wechat-preference-scan · 运行于 YYYY-MM-DD HH:MM · 偏好消息 N · 写作样本 M（累计 T） · 画像维度 D · 状态: {USER_STATUS}
+📊 本期分析：偏好消息 N 条 · 写作样本 M 条（累计 T 条） · 画像维度 D · 状态: USER_STATUS
 ```
