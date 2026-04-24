@@ -31,9 +31,9 @@ def parse_args():
     parser.add_argument('--config', required=True, help='运行时 config.yaml 路径')
     parser.add_argument('--state', help='scan_state.json 路径，默认与 config 同目录')
     parser.add_argument('--days', type=int, default=7, help='读取最近 N 天归档，默认 7')
-    parser.add_argument('--max-preferences', type=int, default=80, help='最多返回偏好消息数')
-    parser.add_argument('--max-writing-samples', type=int, default=80, help='最多返回写作样本数')
-    parser.add_argument('--max-content-chars', type=int, default=260, help='单条内容最大字符数')
+    parser.add_argument('--max-preferences', type=int, default=36, help='最多返回偏好消息数')
+    parser.add_argument('--max-writing-samples', type=int, default=40, help='最多返回写作样本数')
+    parser.add_argument('--max-content-chars', type=int, default=180, help='单条内容最大字符数')
     parser.add_argument('--force', action='store_true', help='忽略当天已运行标记')
     return parser.parse_args()
 
@@ -154,7 +154,6 @@ def _compact_preferences(items, max_chars):
         compact.append({
             'categories': item.get('categories', []),
             'content': _clip(item.get('content', ''), max_chars),
-            'context': _clip(item.get('context', ''), max_chars),
             'contact': item.get('contact', ''),
             'time': item.get('time', ''),
             'msg_time': item.get('msg_time', 0),
